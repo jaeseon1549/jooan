@@ -14,7 +14,7 @@
     near: 3,      // 사전 예약 구간 (± %p) -> 47% / 53% 부터 LOC 미리 걸기
     fee: 0.1,     // 매매 수수료 (%)
     buffer: 0,    // 투입금 배치 시 현금으로 남길 금액 (USD)
-    split: true,  // 밴드 이탈 상태에서 분할 LOC(과매도/과매수 방지)
+    split: false, // (고급) 밴드 이탈 상태에서 주문을 2개로 나누기. 기본은 1개
     always: false // 항상 양방향 LOC 표시
   };
 
@@ -130,7 +130,19 @@
           out.orders.push({ side: 'sell', sym: 'TQQQ', qty: qTrig, limit, tag: '1차 (밴드 경계)' });
           out.orders.push({ side: 'sell', sym: 'TQQQ', qty: qNow - qTrig, limit: r2(st.pT), tag: '2차 (현재가 유지 시)' });
         } else if (qNow > 0) {
-          out.orders.push({ side: 'sell', sym: 'TQQQ', qty: qNow, limit, tag: '밴드 이탈' });
+          // 한 번에 걸기: 수량은 '지금 가격' 기준으로 목표 비중이 되는 주수.
+          // 지정가는 '이 수량을 팔았을 때 비중이 (목표 - 미리걸기구간) 밑으로 내려가지 않는 가장 낮은 종가'.
+          // (그 아래로 떨어지면 체결되지 않아 과매도를 막고, 밴드 경계 가격보다는 높게 유지)
+          const wF = t - near;
+          // 정수 반올림 때문에 지금 가격에서도 하한 밑으로 내려가는 일이 없도록 수량 상한을 둔다
+          const qMax = Math.floor(st.B - (wF * (st.B * st.pT + m.S)) / st.pT + 1e-9);
+          const q = Math.min(qNow, qMax);
+          if (q > 0) {
+            const denom = st.B * (1 - wF) - q;
+            let L = denom > 0 ? (wF * m.S) / denom : st.pT;
+            L = Math.min(Math.max(ceil2(L), limit), r2(st.pT));
+            out.orders.push({ side: 'sell', sym: 'TQQQ', qty: q, limit: Math.max(0.01, L), tag: '밴드 이탈' });
+          }
         }
       } else if (qTrig > 0) {
         out.orders.push({ side: 'sell', sym: 'TQQQ', qty: Math.min(st.B, qTrig), limit, tag: '사전 예약' });
@@ -147,7 +159,15 @@
           out.orders.push({ side: 'buy', sym: 'TQQQ', qty: qTrig, limit, tag: '1차 (밴드 경계)' });
           out.orders.push({ side: 'buy', sym: 'TQQQ', qty: qNow - qTrig, limit: r2(st.pT), tag: '2차 (현재가 유지 시)' });
         } else if (qNow > 0) {
-          out.orders.push({ side: 'buy', sym: 'TQQQ', qty: qNow, limit, tag: '밴드 이탈' });
+          // 지정가는 '이 수량을 샀을 때 비중이 (목표 + 미리걸기구간) 위로 올라가지 않는 가장 높은 종가'.
+          const wC = t + near;
+          const qMax = Math.floor((wC * (st.B * st.pT + m.S)) / st.pT - st.B + 1e-9);
+          const q = Math.min(qNow, qMax);
+          if (q > 0) {
+            const L0 = (wC * m.S) / (st.B * (1 - wC) + q);
+            const L = Math.max(Math.min(floor2(L0), limit), r2(st.pT));
+            out.orders.push({ side: 'buy', sym: 'TQQQ', qty: q, limit: Math.max(0.01, L), tag: '밴드 이탈' });
+          }
         }
       } else if (qTrig > 0) {
         out.orders.push({ side: 'buy', sym: 'TQQQ', qty: qTrig, limit, tag: '사전 예약' });

@@ -1,4 +1,4 @@
-/* 퀀트 내비게이터 - 화면/동작 (바닐라 JS, 외부 의존성 없음) */
+/* 츄테크 - 화면/동작 (바닐라 JS, 외부 의존성 없음) */
 (() => {
   'use strict';
   const { DEFAULT_SETTINGS, metrics, planDeposit, afterDeposit, planLOC, scenarios, applyTrade, daysOld, r2 } = QN;
@@ -9,7 +9,7 @@
   /* ───────────── 상태 ───────────── */
   const blankPx = () => ({ v: 0, date: '', src: 'manual', ts: 0 });
   const defaults = () => ({
-    v: 1,
+    v: 2,
     settings: { ...DEFAULT_SETTINGS },
     hold: { B: 0, C: 0, D: 0 },
     px: { T: blankPx(), S: blankPx(), F: blankPx() },
@@ -33,19 +33,28 @@
     const d = defaults();
     try {
       const raw = JSON.parse(localStorage.getItem(KEY) || 'null');
-      if (raw && typeof raw === 'object') return merge(d, raw);
+      if (raw && typeof raw === 'object') {
+        // v1 -> v2: 주문 1개로 걸기가 기본이 되어서, 예전 기본값(분할 켬)을 한 번 꺼 준다
+        if (!raw.v || raw.v < 2) { raw.settings = { ...(raw.settings || {}), split: false }; raw.v = 2; }
+        return merge(d, raw);
+      }
     } catch (e) { /* 무시 */ }
     return d;
   }
-  let state = load();
+  let real = load();          // 실제 데이터 (저장됨)
+  let state = real;           // 지금 화면이 쓰는 데이터. 모의거래 모드에서는 복사본(저장 안 됨)
+  let sandbox = null;
+  const inTest = () => state !== real;
   let tab = 'today';
   const ui = { busy: false, msg: '', logAll: false };
   let sheet = null;
 
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); }
+  function persist() {
+    try { localStorage.setItem(KEY, JSON.stringify(real)); }
     catch (e) { toast('저장 공간을 쓸 수 없어요. 사생활 보호 모드인지 확인해 주세요.'); }
   }
+  // 모의거래 모드에서는 어떤 변경도 저장하지 않는다
+  function save() { if (state === real) persist(); }
 
   /* ───────────── 유틸 ───────────── */
   const $ = (s, el = document) => el.querySelector(s);
@@ -100,7 +109,7 @@
     }
   }
   async function fetchEOD(sym) {
-    const j = await getJSON(`https://api.twelvedata.com/eod?symbol=${sym}&apikey=${encodeURIComponent(state.apiKey)}`);
+    const j = await getJSON(`https://api.twelvedata.com/eod?symbol=${sym}&apikey=${encodeURIComponent(real.apiKey)}`);
     if (j.status === 'error' || j.code) throw new Error(j.message || 'API 오류');
     const close = parseFloat(j.close);
     if (!(close > 0)) throw new Error('가격 형식 오류');
@@ -113,7 +122,7 @@
     const jobs = [];
     jobs.push(fetchFX().then((r) => { state.px.F = { v: round4(r.rate), date: r.date, src: 'auto', ts: Date.now() }; })
       .catch((e) => errs.push('환율: ' + e.message)));
-    if (state.apiKey) {
+    if (real.apiKey) {
       for (const [k, sym] of [['T', 'TQQQ'], ['S', 'SGOV']]) {
         jobs.push(fetchEOD(sym).then((r) => { state.px[k] = { v: r.price, date: r.date, src: 'auto', ts: Date.now() }; })
           .catch((e) => errs.push(`${sym}: ${e.message}`)));
@@ -305,10 +314,16 @@
     } else {
       body += plan.orders.map((o, i) => {
         const sim = QN.simulate(st2, plan.orders, o.limit, E.cfg); // 분할 주문은 함께 체결되는 기준
+        const breach = plan.zone === 'breach-up' || plan.zone === 'breach-dn';
+        const single = breach && !E.cfg.split;
+        const now = single ? QN.simulate(st2, plan.orders, r2(st2.pT), E.cfg) : null;
+        const effect = single
+          ? `종가가 ${usd(st2.pT)} 그대로면 비중 ${pct1(now.wAfter)}, 지정가 ${usd(o.limit)}에서 체결되면 ${pct1(sim.wAfter)}.`
+          : `종가가 지정가일 때 비중은 약 ${pct1(sim.wAfter)}.`;
         return `<div class="order ${o.side}">
           <div class="order-h"><span class="side">${o.side === 'buy' ? '매수' : '매도'}</span><b>${o.sym}</b><span class="qty">${o.qty}주</span><span class="tag">${esc(o.tag)}</span></div>
           <div class="limit">LOC 지정가 <b>${usd(o.limit)}</b></div>
-          <div class="small muted">${o.side === 'sell' ? '종가가 지정가 이상이면 체결' : '종가가 지정가 이하면 체결'}. 종가가 지정가일 때 비중은 약 ${pct1(sim.wAfter)}.</div>
+          <div class="small muted">${o.side === 'sell' ? '종가가 지정가 이상이면 체결' : '종가가 지정가 이하면 체결'}. ${effect}</div>
           <div class="btns"><button class="btn small" data-act="copy" data-i="${i}">복사</button>
           ${isPinned(o) ? '<span class="done-mark" style="align-self:center">등록됨 ✓</span>' : `<button class="btn primary small grow" data-act="pin" data-i="${i}">주문 걸었어요</button>`}</div>
         </div>`;
@@ -372,7 +387,7 @@
   }
   function renderToday() {
     const px = state.px;
-    const banner = (!isStandalone() && isIOS() && !state.hideInstall)
+    const banner = (!isStandalone() && isIOS() && !real.hideInstall)
       ? `<div class="note info small" style="margin-bottom:12px">홈 화면에 추가하면 앱처럼 열려요. Safari 아래쪽 공유 버튼을 누르고 <b>홈 화면에 추가</b>를 고르세요.
          <div class="btns" style="margin-top:8px"><button class="btn small" data-act="hide-install">알겠어요</button></div></div>` : '';
     $('#app').innerHTML = `${banner}
@@ -431,7 +446,7 @@
     $('#app').innerHTML = `
       <section class="card"><h2>거래 기록</h2>
         <div class="seg" role="radiogroup" aria-label="보기 방식" style="margin-bottom:8px">
-          <button type="button" class="seg-b ${ui.logAll ? '' : 'on'}" role="radio" data-act="log-filter" data-v="trade">실제 거래만</button>
+          <button type="button" class="seg-b ${ui.logAll ? '' : 'on'}" role="radio" data-act="log-filter" data-v="trade">거래만</button>
           <button type="button" class="seg-b ${ui.logAll ? 'on' : ''}" role="radio" data-act="log-filter" data-v="all">보유 수정 포함</button>
         </div>
         ${!ui.logAll && hidden > 0 ? `<p class="small muted" style="margin:0 0 6px">보유 수량을 직접 고친 내역 ${hidden}건은 숨겨져 있어요.</p>` : ''}
@@ -462,18 +477,19 @@
           ${f('fee', '매매 수수료 (%)', s.fee, 0.01, '증권사 수수료율')}
         </div>
         <div style="margin-top:10px">${f('buffer', '투입금 배치 때 현금으로 남길 금액 ($)', s.buffer, 1, '0이면 가능한 만큼 모두 배치해요')}</div>
-        <label class="switch"><input type="checkbox" data-sw="split" ${s.split ? 'checked' : ''}><span><b>분할 LOC 사용</b><span class="small muted">밴드를 이미 넘은 날, 주문을 2개로 나눠 가격이 되돌려져도 과매도(과매수)가 생기지 않게 해요.</span></span></label>
+        <label class="switch"><input type="checkbox" data-sw="split" ${s.split ? 'checked' : ''}><span><b>분할 LOC 사용 (고급)</b><span class="small muted">기본은 주문 1개로 한 번에 목표 비중으로 돌아와요. 켜면 밴드를 넘은 날 주문을 2개로 나눠 가격이 크게 움직이는 날에도 더 정확하게 맞춰요.</span></span></label>
         <label class="switch"><input type="checkbox" data-sw="always" ${s.always ? 'checked' : ''}><span><b>항상 양방향 LOC 표시</b><span class="small muted">큰 갭이 나도 놓치지 않지만, 매수 쪽은 항상 현금이 필요해요.</span></span></label>
       </section>
       <section class="card"><h2>시세 자동 조회</h2>
-        <label class="field"><span>Twelve Data API 키 (선택)</span><input class="in" data-key="apiKey" type="password" autocomplete="off" autocapitalize="off" value="${esc(state.apiKey)}"></label>
+        <label class="field"><span>Twelve Data API 키 (선택)</span><input class="in" data-key="apiKey" type="password" autocomplete="off" autocapitalize="off" value="${esc(real.apiKey)}"></label>
         <p class="small muted" style="margin-bottom:0">twelvedata.com에서 무료로 가입하면 키를 받아요. 키는 이 기기에만 저장돼요. 키가 없어도 직접 입력해서 쓸 수 있어요. 환율은 키 없이 불러와요(ECB 참고환율이라 증권사 적용 환율과 조금 달라요).</p>
       </section>
       <section class="card"><details><summary>이 앱의 계산 방식</summary>
         <div class="stack small">
           <p style="margin:0">TQQQ와 (SGOV + 예수금)을 목표 비중으로 유지해요. 비중이 밴드를 벗어나면 목표 비중으로 되돌리는 LOC 주문을 만들어요.</p>
-          <p style="margin:0"><b>지정가</b>는 보유 수량을 고정했을 때 비중이 밴드 경계가 되는 TQQQ 가격이에요. 종가가 그 선을 넘은 날에만 주문이 체결돼요.</p>
-          <p style="margin:0"><b>수량</b>은 지정가에서 체결됐을 때 목표 비중과 가장 가까워지는 정수 주수예요.</p>
+          <p style="margin:0">밴드를 넘은 날은 <b>주문 1개</b>로 한 번에 목표 비중으로 되돌려요. 수량은 지금 가격에서 목표 비중이 되는 주수예요.</p>
+          <p style="margin:0"><b>지정가</b>는 종가가 많이 움직여 체결돼도 비중이 목표에서 미리 걸기 구간(기본 ±3%p) 넘게 벗어나지 않도록 잡아요. 그 선을 벗어나는 날은 체결되지 않고 다음 날 다시 계산해요.</p>
+          <p style="margin:0">밴드에 가까워졌을 때(53%, 47%부터) 미리 거는 주문은 밴드 경계 가격에서 목표 비중이 되는 수량이에요.</p>
           <p style="margin:0">투입금은 매수만으로 배치해요. 이미 목표를 넘은 쪽은 사지 않고, 현금 한도를 넘겨 사라는 안내는 하지 않아요.</p>
           <p style="margin:0" class="muted">참고용 계산 도구예요. 실제 주문 전에 증권사 화면의 수량과 가격을 꼭 확인하세요.</p>
         </div></details></section>
@@ -484,24 +500,21 @@
   }
 
   /* ───────────── 체결 반영 시트 ───────────── */
-  function openSheet(cfg) { sheet = { ...cfg, mode: 'real' }; renderSheet(); $('#sheet').hidden = false; paintSheet(); }
+  function openSheet(cfg) { sheet = { ...cfg }; renderSheet(); $('#sheet').hidden = false; paintSheetPreview(); }
   function closeSheet() { sheet = null; $('#sheet').hidden = true; $('#sheet').innerHTML = ''; }
   function renderSheet() {
-    const s = sheet;
+    const s = sheet, test = inTest();
     $('#sheet').innerHTML = `<div class="sheet-bg" data-act="sheet-close"></div>
-      <div class="sheet-panel" id="sh-panel" role="dialog" aria-modal="true" aria-label="${esc(s.title)}">
-        <h2>${esc(s.title)}</h2><p class="small muted" style="margin:0 0 10px">${esc(s.sub || '')}</p>
-        <div class="seg" role="radiogroup" aria-label="거래 구분">
-          <button type="button" class="seg-b" role="radio" data-act="sheet-mode" data-mode="real">실제 거래</button>
-          <button type="button" class="seg-b" role="radio" data-act="sheet-mode" data-mode="test">모의 테스트</button>
-        </div>
-        <p class="small muted" id="sh-mode-hint" style="margin:6px 0 0"></p>
+      <div class="sheet-panel ${test ? 'test' : ''}" role="dialog" aria-modal="true" aria-label="${esc(s.title)}">
+        <h2>${esc(s.title)}</h2>
+        <p class="small muted" style="margin:0 0 6px">${esc(s.sub || '')}</p>
+        ${test ? '<div class="note warn small" style="margin:8px 0 4px">모의거래 모드라서 실제 데이터에는 반영되지 않아요.</div>' : ''}
         ${s.depUSD != null ? `<div class="line"><div class="lh">예수금 입금</div><label class="field"><span>입금(환전)된 달러 ($)</span><input class="in" id="sh-dep" inputmode="decimal" value="${r2(s.depUSD)}"></label></div>` : ''}
         ${s.lines.map((l, i) => `<div class="line"><div class="lh">${l.sym} ${l.side === 'buy' ? '매수' : '매도'}</div>
           <div class="grid2"><label class="field"><span>체결 수량 (주)</span><input class="in" data-sh="qty" data-i="${i}" inputmode="decimal" value="${l.qty}"></label>
           <label class="field"><span>체결 단가 ($)</span><input class="in" data-sh="price" data-i="${i}" inputmode="decimal" value="${l.price}"></label></div></div>`).join('')}
         <div class="note info small" id="sh-preview" style="margin-top:12px"></div>
-        <div class="btns" style="margin-top:14px"><button class="btn grow" data-act="sheet-close">취소</button><button class="btn primary grow" id="sh-apply" data-act="sheet-apply"></button></div>
+        <div class="btns" style="margin-top:14px"><button class="btn grow" data-act="sheet-close">취소</button><button class="btn primary grow" data-act="sheet-apply">${test ? '모의로 반영하기' : '반영하기'}</button></div>
       </div>`;
   }
   /** 입력값으로 반영 결과를 계산(저장은 하지 않음) */
@@ -525,22 +538,9 @@
     el.innerHTML = `<b>반영 후</b> TQQQ ${b.B}주에서 ${r.after.B}주, SGOV ${b.C}주에서 ${r.after.C}주, 예수금 ${usd(b.D)}에서 ${usd(r.after.D)}`
       + (r.warns.length ? `<br><span style="color:var(--warn);font-weight:600">${esc(r.warns.join(', '))}</span>` : '');
   }
-  function paintSheet() {
-    if (!sheet) return;
-    const test = sheet.mode === 'test';
-    document.querySelectorAll('#sheet .seg-b').forEach((b) => {
-      const on = b.dataset.mode === sheet.mode;
-      b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
-    });
-    $('#sh-panel').classList.toggle('test', test);
-    $('#sh-mode-hint').textContent = test ? '아무것도 저장하지 않아요. 반영했을 때의 결과만 미리 보여드려요.' : '기록에 남고, 보유 수량과 예수금이 바뀌어요.';
-    $('#sh-apply').textContent = test ? '저장 없이 닫기' : '반영하기';
-    paintSheetPreview();
-  }
   function sheetApply() {
     const s = sheet, r = readSheet();
     if (!r.valid) return toast('수량과 단가를 확인해 주세요');
-    if (s.mode === 'test') { closeSheet(); return toast('모의 테스트예요. 아무것도 저장하지 않았어요'); }
     if (r.warns.length && !window.confirm(r.warns.join('\n') + '\n그래도 반영할까요? (부족한 값은 0으로 처리돼요)')) return;
     const sum = r.lines.map((l) => `${l.sym} ${l.side === 'buy' ? '+' : '−'}${l.qty}`).join(', ');
     const entry = { id: Date.now(), ts: Date.now(), type: s.type, before: { ...state.hold }, after: r.after, restore: {},
@@ -550,7 +550,7 @@
     state.hold = r.after;
     state.history.unshift(entry);
     state.history = state.history.slice(0, 500);
-    save(); closeSheet(); toast('반영했어요'); render();
+    save(); closeSheet(); toast(inTest() ? '모의로 반영했어요 (저장 안 됨)' : '반영했어요'); render();
   }
 
   /* ───────────── 동작 ───────────── */
@@ -577,8 +577,8 @@
     try { obj = JSON.parse(txt); } catch (e) { return toast('백업 형식이 올바르지 않아요'); }
     if (!obj || typeof obj !== 'object' || !obj.hold || !Number.isFinite(Number(obj.hold.B))) return toast('백업 형식이 올바르지 않아요');
     if (!window.confirm('현재 데이터를 백업 내용으로 바꿀까요?')) return;
-    state = merge(defaults(), { ...obj, apiKey: state.apiKey });
-    save(); toast('복원했어요'); render();
+    real = merge(defaults(), { ...obj, apiKey: real.apiKey });
+    state = real; persist(); toast('복원했어요'); render();
   }
   function paintBadge() {
     const t = $('[data-tab="today"]'); if (!t) return;
@@ -588,7 +588,30 @@
   function render() {
     document.querySelectorAll('.tab').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
     if (tab === 'today') renderToday(); else if (tab === 'hold') renderHold(); else if (tab === 'log') renderLog(); else renderSet();
-    paintBadge();
+    paintBadge(); paintTop();
+  }
+  function paintTop() {
+    const test = inTest();
+    $('#top').classList.toggle('test', test);
+    $('#tabs').classList.toggle('test', test);
+    $('#top-title').textContent = test ? '모의거래 모드' : '츄테크';
+    $('#top-sub').textContent = test ? '연습용이에요. 실제 데이터는 그대로예요' : 'TQQQ와 SGOV, 섀넌의 도깨비';
+    const b = $('#mode-btn');
+    b.textContent = test ? '모의거래 끄기' : '모의거래';
+    b.setAttribute('aria-pressed', String(test));
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', test ? '#e3a008' : '#0f1e33');
+  }
+  function enterTest() {
+    sandbox = JSON.parse(JSON.stringify(real)); // 지금 실제 데이터를 복사해서 시작
+    state = sandbox; ui.msg = '';
+    closeSheet(); render();
+    toast('모의거래 모드예요. 실제 데이터는 그대로예요');
+  }
+  function exitTest() {
+    sandbox = null; state = real; ui.msg = '';
+    closeSheet(); render();
+    toast('실제 모드로 돌아왔어요. 연습한 내용은 지워졌어요');
   }
   function goTab(t) { tab = t; render(); window.scrollTo(0, 0); }
 
@@ -598,9 +621,13 @@
     const el = ev.target.closest('[data-act]'); if (!el) return;
     const act = el.dataset.act, i = Number(el.dataset.i);
     const E = ['pin', 'copy', 'apply-dep', 'apply-fund', 'apply-idle', 'dep-only', 'fill'].includes(act) ? engine() : null;
+    if (inTest() && ['export', 'restore', 'reset'].includes(act)) {
+      return toast('모의거래 모드에서는 쓸 수 없어요. 먼저 모의거래를 꺼 주세요');
+    }
     switch (act) {
+      case 'mode-toggle': if (inTest()) exitTest(); else enterTest(); break;
       case 'refresh': refresh(); break;
-      case 'hide-install': state.hideInstall = true; save(); render(); break;
+      case 'hide-install': real.hideInstall = true; persist(); render(); break;
       case 'copy': { const o = E.plan && E.plan.orders[i]; if (o) copyText(`${o.sym} ${o.side === 'buy' ? '매수' : '매도'} LOC ${o.qty}주 지정가 $${o.limit.toFixed(2)}`); break; }
       case 'pin': {
         const o = E.plan && E.plan.orders[i]; if (!o || isPinned(o)) break;
@@ -637,7 +664,6 @@
         openSheet({ title: 'SGOV 매수 반영', sub: '놀고 있는 예수금으로 산 SGOV예요.', lines: [{ sym: 'SGOV', side: 'buy', qty: q.qS, price: E.st2.pS }], type: 'idle', label: 'SGOV 매수(유휴 예수금)' });
         break;
       }
-      case 'sheet-mode': if (sheet) { sheet.mode = el.dataset.mode; paintSheet(); } break;
       case 'log-filter': ui.logAll = el.dataset.v === 'all'; renderLog(); break;
       case 'del-log': {
         if (!window.confirm('이 기록을 지울까요? 보유 수량은 바뀌지 않아요.')) break;
@@ -652,7 +678,7 @@
       case 'export': exportBackup(); break;
       case 'restore': restoreBackup(); break;
       case 'reset':
-        if (window.confirm('보유, 기록, 설정을 모두 지울까요? 되돌릴 수 없어요.')) { state = defaults(); save(); toast('초기화했어요'); render(); }
+        if (window.confirm('보유, 기록, 설정을 모두 지울까요? 되돌릴 수 없어요.')) { real = defaults(); state = real; persist(); toast('초기화했어요'); render(); }
         break;
     }
   });
@@ -693,7 +719,7 @@
     } else if (el.dataset.sw) {
       state.settings[el.dataset.sw] = el.checked; save();
     } else if (el.dataset.key) {
-      state.apiKey = el.value.trim(); save(); toast(state.apiKey ? '키를 저장했어요' : '키를 지웠어요');
+      real.apiKey = el.value.trim(); persist(); toast(real.apiKey ? '키를 저장했어요' : '키를 지웠어요');
     }
   });
 

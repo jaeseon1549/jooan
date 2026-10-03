@@ -231,5 +231,13 @@ textarea.in { min-height: 110px; font-size: 13px; font-family: ui-monospace, Men
 .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
 .seg-b { min-height: 42px; border: 0; border-radius: 9px; background: transparent; color: var(--ink2); font-weight: 700; cursor: pointer; }
 .seg-b.on { background: var(--ink); color: var(--card); }
-.seg-b.on[data-mode="test"] { background: var(--amber); color: #14202e; }
 .sheet-panel.test { border-top: 5px solid var(--amber); }
+
+/* ── 상단 모의거래 버튼과 모의거래 모드 표시 */
+.top-in > div { min-width: 0; }
+.top small { display: block; }
+.mode-btn { flex: none; min-height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #5f7794; background: transparent; color: #eaf1fa; font-weight: 700; font-size: 13px; cursor: pointer; }
+.top.test { background: var(--amber); color: #14202e; }
+.top.test small { color: #4a3500; }
+.top.test .mode-btn { background: #14202e; border-color: #14202e; color: #fff; }
+.tabs.test { border-top: 3px solid var(--amber); }

@@ -8,25 +8,28 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="퀀트내비">
+  <meta name="apple-mobile-web-app-title" content="츄테크">
   <meta name="format-detection" content="telephone=no">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" href="icons/icon-180.png">
   <link rel="icon" type="image/png" href="icons/icon-192.png">
   <link rel="stylesheet" href="style.css">
-  <title>퀀트 내비게이터</title>
+  <title>츄테크</title>
 </head>
 <body>
-  <header class="top">
+  <header class="top" id="top">
     <div class="top-in">
-      <h1>퀀트 내비게이터</h1>
-      <small id="top-sub">TQQQ와 SGOV, 섀넌의 도깨비</small>
+      <div>
+        <h1 id="top-title">츄테크</h1>
+        <small id="top-sub">TQQQ와 SGOV, 섀넌의 도깨비</small>
+      </div>
+      <button type="button" class="mode-btn" id="mode-btn" data-act="mode-toggle" aria-pressed="false">모의거래</button>
     </div>
   </header>
 
   <main id="app" aria-live="polite"></main>
 
-  <nav class="tabs" aria-label="메뉴">
+  <nav class="tabs" id="tabs" aria-label="메뉴">
     <div class="tabs-in" role="tablist">
       <button class="tab" role="tab" data-tab="today">오늘</button>
       <button class="tab" role="tab" data-tab="hold">보유</button>

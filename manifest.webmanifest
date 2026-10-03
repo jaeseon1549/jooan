@@ -1,6 +1,6 @@
 {
-  "name": "퀀트 내비게이터",
-  "short_name": "퀀트내비",
+  "name": "츄테크",
+  "short_name": "츄테크",
   "description": "TQQQ와 SGOV 섀넌의 도깨비 전략 LOC 주문 계산기",
   "lang": "ko",
   "start_url": "./",
