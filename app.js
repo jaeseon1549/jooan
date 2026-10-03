@@ -137,7 +137,7 @@
     const dep = st.depKRW > 0 && st.fx > 0 ? planDeposit(st, cfg) : null;
     const st2 = dep ? afterDeposit(st, dep) : st;
     const plan = dep ? planLOC(st2, cfg) : plan0;
-    const sc = scenarios(st2, plan.orders, cfg);
+    const sc = scenarios(st2, plan.orders, cfg, null, plan.fund);
     return { ready: true, st, st2, cfg, plan0, dep, plan, sc, m: metrics(st) };
   }
   const sameOrder = (a, b) => a.side === b.side && a.sym === b.sym && a.qty === b.qty && Math.abs(a.limit - b.limit) < 0.005;
@@ -261,6 +261,38 @@
     </section>`;
   }
 
+
+  function finishHTML(E) {
+    const { st2, plan, cfg } = E;
+    if (plan.zone === 'empty' || !plan.orders.length) return '';
+    const list = QN.finishPlan(st2, plan, cfg);
+    if (!list.length) return '';
+    const fee = cfg.fee / 100;
+    const blocks = list.map((f) => {
+      const n = f.sgov.qty, amt = n * st2.pS * (1 + fee);
+      const when = f.breach ? `종가가 지금 가격 ${usd(f.p)} 그대로일 때` : `종가가 지정가 ${usd(f.p)}일 때 (딱 그 선에서 체결되는 경우)`;
+      let steps;
+      if (f.side === 'sell') {
+        steps = `<li><b>TQQQ ${f.qty}주 매도</b> (LOC). 매도대금 약 ${usd(f.proceeds)}</li>
+          <li>${n > 0 ? `매도가 체결돼 예수금이 생기면 <b>SGOV ${n}주 매수</b> (약 ${usd(amt)})` : 'SGOV 1주를 살 만큼의 금액이 아니에요. 예수금으로 두세요'}</li>`;
+      } else {
+        const sell = f.sgov.act === 'sell'
+          ? `<li>장이 열리기 전(데이장)에 <b>SGOV ${n}주 매도</b>로 약 ${usd(n * st2.pS * (1 - fee))} 확보</li>`
+          : '<li>예수금이 충분해서 SGOV를 팔 필요는 없어요</li>';
+        steps = `${sell}<li><b>TQQQ ${f.qty}주 매수</b> (LOC). 매수대금 약 ${usd(f.cost)}</li>`;
+      }
+      const row = (label, c, cls) => `<tr class="${cls || ''}"><td>${label}</td><td>${pct1(c.t)}</td><td>${pct1(c.s)}</td><td>${pct1(c.c)}</td></tr>`;
+      return `<div>
+        <p class="small muted" style="margin:0 0 6px">${when}</p>
+        <ol style="margin:0 0 12px;padding-left:20px" class="stack">${steps}</ol>
+        <table class="tbl"><thead><tr><th>비중</th><th>TQQQ</th><th>SGOV</th><th>현금</th></tr></thead>
+          <tbody>${row('지금', f.before.comp)}${row('정리 후', f.comp, 'now')}</tbody></table>
+        <p class="small muted" style="margin:8px 0 0">수량은 TQQQ ${f.before.B}주에서 ${f.B}주, SGOV ${f.before.C}주에서 ${f.C}주, 예수금 ${usd(f.before.D)}에서 ${usd(f.D)}가 돼요 (수수료 ${cfg.fee}% 반영).</p>
+      </div>`;
+    }).join('<hr style="border:0;border-top:1px solid var(--line);margin:14px 0">');
+    return `<section class="card"><h2>체결되면 이렇게 돼요</h2>${blocks}</section>`;
+  }
+
   function ordersHTML(E) {
     const { plan, st2, dep } = E;
     const head = `<h2>오늘 걸 주문</h2>${dep ? '<p class="small muted" style="margin:-6px 0 10px">위 투입금 매수가 체결된 뒤 보유 기준이에요.</p>' : ''}`;
@@ -300,11 +332,12 @@
     if (!(E.m.H > 0) || E.plan.zone === 'empty') return '';
     const rows = E.sc.map((s) => {
       const sign = s.r > 0 ? '+' : s.r < 0 ? '−' : '';
-      return `<tr class="${s.filled ? 'hit' : ''} ${s.r === 0 ? 'now' : ''}"><td>${sign}${Math.abs(s.r)}%</td><td>${usd(s.p)}</td><td>${pct1(s.wBefore)}</td><td>${s.filled ? `${s.filled}건` : '없음'}</td><td>${pct1(s.wAfter)}</td></tr>`;
+      const g = s.sgov.act === 'buy' ? `+${s.sgov.qty}주` : s.sgov.act === 'sell' ? `−${s.sgov.qty}주` : '-';
+      return `<tr class="${s.filled ? 'hit' : ''} ${s.r === 0 ? 'now' : ''}"><td>${sign}${Math.abs(s.r)}%</td><td>${usd(s.p)}</td><td>${pct1(s.wBefore)}</td><td>${pct1(s.wAfter)}</td><td>${g}</td></tr>`;
     }).join('');
     return `<section class="card"><details><summary>오늘 종가별 시나리오</summary>
-      <table class="tbl"><thead><tr><th>TQQQ 변동</th><th>종가</th><th>비중</th><th>체결</th><th>체결 후</th></tr></thead><tbody>${rows}</tbody></table>
-      <p class="small muted" style="margin-bottom:0">위 주문이 걸려 있을 때 종가가 이렇게 끝나면 어떻게 되는지 보여줘요. 노란 줄은 주문이 체결되는 경우예요.</p></details></section>`;
+      <table class="tbl"><thead><tr><th>TQQQ 변동</th><th>종가</th><th>비중</th><th>체결 후</th><th>SGOV</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="small muted" style="margin-bottom:0">위 주문이 걸려 있을 때 종가가 이렇게 끝나면 어떻게 되는지 보여줘요. 노란 줄은 주문이 체결되는 경우예요. SGOV 칸은 체결된 대금으로 SGOV를 사야 하는 수량(+) 또는 매수 자금을 위해 먼저 팔아야 하는 수량(−)이에요.</p></details></section>`;
   }
 
   function resultsA() {
@@ -315,7 +348,7 @@
         <div class="btns" style="justify-content:center;margin-top:8px"><button class="btn small" data-act="refresh" ${ui.busy ? 'disabled' : ''}>${ui.busy ? '불러오는 중' : '시세 불러오기'}</button></div>
         ${ui.msg ? `<div class="small muted" style="white-space:pre-line;margin-top:8px">${esc(ui.msg)}</div>` : ''}</section>`;
     }
-    return heroHTML(E) + staleNotes(E) + pendingHTML(E) + depositHTML(E) + ordersHTML(E);
+    return heroHTML(E) + staleNotes(E) + pendingHTML(E) + depositHTML(E) + ordersHTML(E) + finishHTML(E);
   }
   function resultsB() {
     const E = engine();

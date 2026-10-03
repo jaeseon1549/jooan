@@ -174,12 +174,59 @@
     return out;
   }
 
+  /**
+   * 체결 뒤 정리: 종가 p 에서 주문이 체결된다고 가정했을 때
+   *  - 매도 체결 → 매도대금(+예수금)으로 SGOV 를 최대한 매수
+   *  - 매수 LOC 자금 부족 → fund.sgovSell 만큼 SGOV 를 먼저 매도(체결 여부와 무관)
+   * 결과로 TQQQ / SGOV / 현금 구성 비율과 SGOV 순매매 수량을 돌려준다.
+   */
+  function settle(st, orders, p, cfg, fund) {
+    const fee = cfg.fee / 100;
+    const sim = simulate(st, orders, p, cfg);
+    const B = sim.B;
+    let C = st.C, D = sim.cash;
+    const sells = sim.filled.filter((o) => o.side === 'sell').reduce((a, o) => a + o.qty, 0);
+    const buys = sim.filled.filter((o) => o.side === 'buy').reduce((a, o) => a + o.qty, 0);
+    if (fund && fund.sgovSell > 0) { C -= fund.sgovSell; D += fund.sgovSell * st.pS * (1 - fee); }
+    if (sells > 0) {
+      const q = Math.max(0, Math.floor((D - cfg.buffer) / (st.pS * (1 + fee)) + EPS));
+      if (q > 0) { C += q; D -= q * st.pS * (1 + fee); }
+    }
+    const net = C - st.C;
+    const T = B * p, Sv = C * st.pS, H = T + Sv + D;
+    return {
+      p, B, C, D, sells, buys, filled: sim.filled.length,
+      proceeds: sells * p * (1 - fee), cost: buys * p * (1 + fee),
+      sgov: { act: net > 0 ? 'buy' : net < 0 ? 'sell' : null, qty: Math.abs(net), amount: Math.abs(net) * st.pS },
+      comp: H > 0 ? { t: T / H, s: Sv / H, c: D / H } : { t: 0, s: 0, c: 0 }
+    };
+  }
+
+  /** 주문 방향별로 "체결되면 이렇게 된다" 요약. 밴드 이탈이면 현재가 유지, 사전 예약이면 지정가에서 체결되는 경우 */
+  function finishPlan(st, plan, cfg) {
+    const out = [];
+    for (const side of ['sell', 'buy']) {
+      const os = plan.orders.filter((o) => o.side === side);
+      if (!os.length) continue;
+      const breach = side === 'sell' ? plan.zone === 'breach-up' : plan.zone === 'breach-dn';
+      const p = breach ? r2(st.pT) : os[0].limit;
+      const f = settle(st, os, p, cfg, side === 'buy' ? plan.fund : null);
+      const T0 = st.B * p, S0 = st.C * st.pS, H0 = T0 + S0 + st.D;
+      out.push({
+        side, breach, orders: os, qty: side === 'sell' ? f.sells : f.buys, ...f,
+        before: { B: st.B, C: st.C, D: st.D, comp: { t: T0 / H0, s: S0 / H0, c: st.D / H0 } }
+      });
+    }
+    return out;
+  }
+
   /** 시나리오 표: 오늘 종가가 x% 움직이면? */
-  function scenarios(st, orders, cfg, moves) {
+  function scenarios(st, orders, cfg, moves, fund) {
     return (moves || [-20, -15, -10, -5, -2, 0, 2, 5, 10, 15, 20]).map((r) => {
       const p = st.pT * (1 + r / 100);
       const s = simulate(st, orders, p, cfg);
-      return { r, p, wBefore: s.wBefore, wAfter: s.wAfter, filled: s.filled.length };
+      const f = settle(st, orders, p, cfg, fund);
+      return { r, p, wBefore: s.wBefore, wAfter: s.wAfter, filled: s.filled.length, sgov: f.sgov, comp: f.comp };
     });
   }
 
@@ -214,6 +261,6 @@
 
   return {
     DEFAULT_SETTINGS, metrics, needSell, needBuy, planDeposit, afterDeposit,
-    planLOC, simulate, scenarios, applyTrade, daysOld, r2
+    planLOC, simulate, settle, finishPlan, scenarios, applyTrade, daysOld, r2
   };
 });
