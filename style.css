@@ -226,3 +226,10 @@ textarea.in { min-height: 110px; font-size: 13px; font-family: ui-monospace, Men
 .switch input { width: 22px; height: 22px; margin-top: 2px; accent-color: var(--navy); flex: none; }
 .switch b { display: block; }
 .link { color: var(--sell); text-decoration: underline; background: none; border: 0; padding: 0; cursor: pointer; font-size: inherit; }
+
+/* ── 선택 스위치(실제 거래 / 모의 테스트, 기록 보기 방식) */
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+.seg-b { min-height: 42px; border: 0; border-radius: 9px; background: transparent; color: var(--ink2); font-weight: 700; cursor: pointer; }
+.seg-b.on { background: var(--ink); color: var(--card); }
+.seg-b.on[data-mode="test"] { background: var(--amber); color: #14202e; }
+.sheet-panel.test { border-top: 5px solid var(--amber); }

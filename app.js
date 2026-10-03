@@ -39,7 +39,7 @@
   }
   let state = load();
   let tab = 'today';
-  const ui = { busy: false, msg: '' };
+  const ui = { busy: false, msg: '', logAll: false };
   let sheet = null;
 
   function save() {
@@ -419,14 +419,28 @@
 
   /* ───────────── 화면: 기록 ───────────── */
   function renderLog() {
-    const hs = state.history.slice(0, 60);
-    const list = hs.length ? hs.map((e) => `<div class="hist">
-        <div class="d">${fmtDT(e.ts)}</div><div class="t">${esc(e.label)}</div>
+    const all = state.history;
+    const trades = all.filter((e) => e.type !== 'adjust');
+    const shown = (ui.logAll ? all : trades).slice(0, 60);
+    const hidden = all.length - trades.length;
+    const list = shown.length ? shown.map((e) => `<div class="hist">
+        <div class="row" style="align-items:flex-start"><div><div class="d">${fmtDT(e.ts)}${e.type === 'adjust' ? ', 보유 수량 직접 수정' : ''}</div><div class="t">${esc(e.label)}</div></div>
+        <button class="btn small" data-act="del-log" data-id="${e.id}">삭제</button></div>
         <div class="h">TQQQ ${e.after.B}주, SGOV ${e.after.C}주, 예수금 ${usd(e.after.D)}</div></div>`).join('')
-      : '<div class="empty"><p class="muted">아직 기록이 없어요.<br>체결을 반영하면 여기에 쌓여요.</p></div>';
+      : '<div class="empty"><p class="muted">아직 기록이 없어요.<br>실제 거래를 체결 반영하면 여기에 쌓여요.<br>모의 테스트로 반영한 내용은 기록되지 않아요.</p></div>';
     $('#app').innerHTML = `
-      <section class="card"><div class="row" style="margin-bottom:6px"><h2 style="margin:0">거래 기록</h2>
-        <button class="btn small danger" data-act="undo" ${hs.length ? '' : 'disabled'}>마지막 되돌리기</button></div>${list}</section>
+      <section class="card"><h2>거래 기록</h2>
+        <div class="seg" role="radiogroup" aria-label="보기 방식" style="margin-bottom:8px">
+          <button type="button" class="seg-b ${ui.logAll ? '' : 'on'}" role="radio" data-act="log-filter" data-v="trade">실제 거래만</button>
+          <button type="button" class="seg-b ${ui.logAll ? 'on' : ''}" role="radio" data-act="log-filter" data-v="all">보유 수정 포함</button>
+        </div>
+        ${!ui.logAll && hidden > 0 ? `<p class="small muted" style="margin:0 0 6px">보유 수량을 직접 고친 내역 ${hidden}건은 숨겨져 있어요.</p>` : ''}
+        ${list}
+        <div class="btns" style="margin-top:12px">
+          <button class="btn small danger" data-act="undo" ${all.length ? '' : 'disabled'}>마지막 되돌리기</button>
+          <button class="btn small" data-act="clear-log" ${all.length ? '' : 'disabled'}>기록 비우기</button>
+        </div>
+      </section>
       <section class="card"><h2>백업과 복원</h2>
         <p class="small muted" style="margin-top:0">폰을 바꾸거나 앱을 지웠을 때를 대비해 가끔 백업해 두세요. 백업을 복사해 메모 앱에 붙여 두면 돼요. API 키는 포함되지 않아요.</p>
         <div class="btns"><button class="btn grow" data-act="export">백업 복사</button></div>
@@ -470,38 +484,70 @@
   }
 
   /* ───────────── 체결 반영 시트 ───────────── */
-  function openSheet(cfg) { sheet = cfg; renderSheet(); $('#sheet').hidden = false; }
+  function openSheet(cfg) { sheet = { ...cfg, mode: 'real' }; renderSheet(); $('#sheet').hidden = false; paintSheet(); }
   function closeSheet() { sheet = null; $('#sheet').hidden = true; $('#sheet').innerHTML = ''; }
   function renderSheet() {
     const s = sheet;
     $('#sheet').innerHTML = `<div class="sheet-bg" data-act="sheet-close"></div>
-      <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="${esc(s.title)}">
-        <h2>${esc(s.title)}</h2><p class="small muted" style="margin:0 0 6px">${esc(s.sub || '')}</p>
+      <div class="sheet-panel" id="sh-panel" role="dialog" aria-modal="true" aria-label="${esc(s.title)}">
+        <h2>${esc(s.title)}</h2><p class="small muted" style="margin:0 0 10px">${esc(s.sub || '')}</p>
+        <div class="seg" role="radiogroup" aria-label="거래 구분">
+          <button type="button" class="seg-b" role="radio" data-act="sheet-mode" data-mode="real">실제 거래</button>
+          <button type="button" class="seg-b" role="radio" data-act="sheet-mode" data-mode="test">모의 테스트</button>
+        </div>
+        <p class="small muted" id="sh-mode-hint" style="margin:6px 0 0"></p>
         ${s.depUSD != null ? `<div class="line"><div class="lh">예수금 입금</div><label class="field"><span>입금(환전)된 달러 ($)</span><input class="in" id="sh-dep" inputmode="decimal" value="${r2(s.depUSD)}"></label></div>` : ''}
         ${s.lines.map((l, i) => `<div class="line"><div class="lh">${l.sym} ${l.side === 'buy' ? '매수' : '매도'}</div>
           <div class="grid2"><label class="field"><span>체결 수량 (주)</span><input class="in" data-sh="qty" data-i="${i}" inputmode="decimal" value="${l.qty}"></label>
           <label class="field"><span>체결 단가 ($)</span><input class="in" data-sh="price" data-i="${i}" inputmode="decimal" value="${l.price}"></label></div></div>`).join('')}
-        <div class="btns" style="margin-top:14px"><button class="btn grow" data-act="sheet-close">취소</button><button class="btn primary grow" data-act="sheet-apply">반영하기</button></div>
+        <div class="note info small" id="sh-preview" style="margin-top:12px"></div>
+        <div class="btns" style="margin-top:14px"><button class="btn grow" data-act="sheet-close">취소</button><button class="btn primary grow" id="sh-apply" data-act="sheet-apply"></button></div>
       </div>`;
   }
-  function sheetApply() {
+  /** 입력값으로 반영 결과를 계산(저장은 하지 않음) */
+  function readSheet() {
     const s = sheet, cfg = state.settings;
     const lines = s.lines.map((l, i) => ({ ...l,
       qty: num($(`[data-sh="qty"][data-i="${i}"]`).value), price: num($(`[data-sh="price"][data-i="${i}"]`).value) }));
     const dep = s.depUSD != null ? num($('#sh-dep').value) : 0;
-    for (const l of lines) if (!(l.qty > 0) || !(l.price > 0)) return toast('수량과 단가를 확인해 주세요');
+    const valid = lines.every((l) => l.qty > 0 && l.price > 0);
     let h = { ...state.hold };
     h.D = r2(h.D + dep);
     const warns = [];
-    for (const l of lines) { const r = applyTrade(h, l, cfg); h = r.h; if (r.warn) warns.push(r.warn); }
-    if (warns.length && !window.confirm(warns.join('\n') + '\n그래도 반영할까요? (부족한 값은 0으로 처리돼요)')) return;
-    h = { B: Math.max(0, round4(h.B)), C: Math.max(0, round4(h.C)), D: Math.max(0, r2(h.D)) };
-    const sum = lines.map((l) => `${l.sym} ${l.side === 'buy' ? '+' : '−'}${l.qty}`).join(', ');
-    const entry = { id: Date.now(), ts: Date.now(), type: s.type, before: { ...state.hold }, after: h, restore: {},
-      label: `${s.label}${sum ? `: ${sum}` : dep ? `: 예수금 +${usd(dep)}` : ''}` };
+    if (valid) for (const l of lines) { const r = applyTrade(h, l, cfg); h = r.h; if (r.warn) warns.push(r.warn); }
+    const after = { B: Math.max(0, round4(h.B)), C: Math.max(0, round4(h.C)), D: Math.max(0, r2(h.D)) };
+    return { lines, dep, valid, warns, after };
+  }
+  function paintSheetPreview() {
+    const el = $('#sh-preview'); if (!el || !sheet) return;
+    const r = readSheet(), b = state.hold;
+    if (!r.valid) { el.textContent = '수량과 단가를 입력하면 반영 결과를 보여드려요.'; return; }
+    el.innerHTML = `<b>반영 후</b> TQQQ ${b.B}주에서 ${r.after.B}주, SGOV ${b.C}주에서 ${r.after.C}주, 예수금 ${usd(b.D)}에서 ${usd(r.after.D)}`
+      + (r.warns.length ? `<br><span style="color:var(--warn);font-weight:600">${esc(r.warns.join(', '))}</span>` : '');
+  }
+  function paintSheet() {
+    if (!sheet) return;
+    const test = sheet.mode === 'test';
+    document.querySelectorAll('#sheet .seg-b').forEach((b) => {
+      const on = b.dataset.mode === sheet.mode;
+      b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+    });
+    $('#sh-panel').classList.toggle('test', test);
+    $('#sh-mode-hint').textContent = test ? '아무것도 저장하지 않아요. 반영했을 때의 결과만 미리 보여드려요.' : '기록에 남고, 보유 수량과 예수금이 바뀌어요.';
+    $('#sh-apply').textContent = test ? '저장 없이 닫기' : '반영하기';
+    paintSheetPreview();
+  }
+  function sheetApply() {
+    const s = sheet, r = readSheet();
+    if (!r.valid) return toast('수량과 단가를 확인해 주세요');
+    if (s.mode === 'test') { closeSheet(); return toast('모의 테스트예요. 아무것도 저장하지 않았어요'); }
+    if (r.warns.length && !window.confirm(r.warns.join('\n') + '\n그래도 반영할까요? (부족한 값은 0으로 처리돼요)')) return;
+    const sum = r.lines.map((l) => `${l.sym} ${l.side === 'buy' ? '+' : '−'}${l.qty}`).join(', ');
+    const entry = { id: Date.now(), ts: Date.now(), type: s.type, before: { ...state.hold }, after: r.after, restore: {},
+      label: `${s.label}${sum ? `: ${sum}` : r.dep ? `: 예수금 +${usd(r.dep)}` : ''}` };
     if (s.clearDep) { entry.restore.depKRW = state.depKRW; state.depKRW = 0; }
     if (s.pendIdx != null && state.pending[s.pendIdx]) { entry.restore.pending = state.pending[s.pendIdx]; state.pending.splice(s.pendIdx, 1); }
-    state.hold = h;
+    state.hold = r.after;
     state.history.unshift(entry);
     state.history = state.history.slice(0, 500);
     save(); closeSheet(); toast('반영했어요'); render();
@@ -510,6 +556,10 @@
   /* ───────────── 동작 ───────────── */
   function undoLast() {
     const e = state.history[0]; if (!e) return;
+    const h = state.hold;
+    if (e.after.B !== h.B || e.after.C !== h.C || Math.abs(e.after.D - h.D) > 0.005) {
+      return toast('지금 보유가 마지막 기록과 달라서 되돌릴 수 없어요');
+    }
     if (!window.confirm(`마지막 기록을 되돌릴까요?\n${e.label}`)) return;
     state.hold = { ...e.before };
     if (e.restore && e.restore.depKRW) state.depKRW = e.restore.depKRW;
@@ -587,6 +637,15 @@
         openSheet({ title: 'SGOV 매수 반영', sub: '놀고 있는 예수금으로 산 SGOV예요.', lines: [{ sym: 'SGOV', side: 'buy', qty: q.qS, price: E.st2.pS }], type: 'idle', label: 'SGOV 매수(유휴 예수금)' });
         break;
       }
+      case 'sheet-mode': if (sheet) { sheet.mode = el.dataset.mode; paintSheet(); } break;
+      case 'log-filter': ui.logAll = el.dataset.v === 'all'; renderLog(); break;
+      case 'del-log': {
+        if (!window.confirm('이 기록을 지울까요? 보유 수량은 바뀌지 않아요.')) break;
+        state.history = state.history.filter((e) => String(e.id) !== el.dataset.id); save(); renderLog(); break;
+      }
+      case 'clear-log':
+        if (window.confirm('거래 기록을 모두 지울까요? 보유 수량과 예수금은 그대로예요.')) { state.history = []; save(); toast('기록을 비웠어요'); renderLog(); }
+        break;
       case 'sheet-close': closeSheet(); break;
       case 'sheet-apply': sheetApply(); break;
       case 'undo': undoLast(); break;
@@ -600,6 +659,7 @@
 
   document.addEventListener('input', (ev) => {
     const id = ev.target.id;
+    if (sheet && (id === 'sh-dep' || (ev.target.dataset && ev.target.dataset.sh))) return paintSheetPreview();
     if (id === 'in-T' || id === 'in-S' || id === 'in-F') {
       const k = id.slice(3);
       state.px[k] = { v: num(ev.target.value), date: '', src: 'manual', ts: Date.now() };
