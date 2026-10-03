@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1e33">
+  <meta name="color-scheme" content="light dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="퀀트내비">
+  <meta name="format-detection" content="telephone=no">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+  <title>퀀트 내비게이터</title>
+</head>
+<body>
+  <header class="top">
+    <div class="top-in">
+      <h1>퀀트 내비게이터</h1>
+      <small id="top-sub">TQQQ와 SGOV, 섀넌의 도깨비</small>
+    </div>
+  </header>
+
+  <main id="app" aria-live="polite"></main>
+
+  <nav class="tabs" aria-label="메뉴">
+    <div class="tabs-in" role="tablist">
+      <button class="tab" role="tab" data-tab="today">오늘</button>
+      <button class="tab" role="tab" data-tab="hold">보유</button>
+      <button class="tab" role="tab" data-tab="log">기록</button>
+      <button class="tab" role="tab" data-tab="set">설정</button>
+    </div>
+  </nav>
+
+  <div id="sheet" class="sheet" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="logic.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

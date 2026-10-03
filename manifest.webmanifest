@@ -1,0 +1,17 @@
+{
+  "name": "퀀트 내비게이터",
+  "short_name": "퀀트내비",
+  "description": "TQQQ와 SGOV 섀넌의 도깨비 전략 LOC 주문 계산기",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1e33",
+  "theme_color": "#0f1e33",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
