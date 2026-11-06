@@ -5,6 +5,7 @@
 
   const KEY = 'qn.v1';
   const STALE_MS = 20 * 3600 * 1000;
+  const LIVE_STALE_MS = 30 * 60 * 1000;   // 장중 현재가는 30분 지나면 낡은 값으로 본다
 
   /* ───────────── 상태 ───────────── */
   const blankPx = () => ({ v: 0, date: '', src: 'manual', ts: 0 });
@@ -17,7 +18,9 @@
     pending: [],
     history: [],
     apiKey: '',
-    hideInstall: false
+    hideInstall: false,
+    hideNotifHint: false,
+    sync: { url: '', token: '', lastOk: 0, lastErr: '' }
   });
   function merge(d, raw) {
     const out = { ...d, ...raw };
@@ -25,6 +28,7 @@
     out.hold = { ...d.hold, ...(raw.hold || {}) };
     const px = raw.px || {};
     out.px = { T: { ...blankPx(), ...px.T }, S: { ...blankPx(), ...px.S }, F: { ...blankPx(), ...px.F } };
+    out.sync = { ...d.sync, ...(raw.sync || {}) };
     out.pending = Array.isArray(raw.pending) ? raw.pending : [];
     out.history = Array.isArray(raw.history) ? raw.history : [];
     return out;
@@ -46,13 +50,15 @@
   let sandbox = null;
   const inTest = () => state !== real;
   let tab = 'today';
-  const ui = { busy: false, msg: '', logAll: false };
+  const ui = { busy: false, msg: '', logAll: false, status: null };
+  const syncSt = { timer: 0, sent: '', chain: Promise.resolve() };
   let sheet = null;
 
-  function persist() {
+  function writeReal(quiet) {
     try { localStorage.setItem(KEY, JSON.stringify(real)); }
-    catch (e) { toast('저장 공간을 쓸 수 없어요. 사생활 보호 모드인지 확인해 주세요.'); }
+    catch (e) { if (!quiet) toast('저장 공간을 쓸 수 없어요. 사생활 보호 모드인지 확인해 주세요.'); }
   }
+  function persist() { writeReal(false); scheduleSync(); }
   // 모의거래 모드에서는 어떤 변경도 저장하지 않는다
   function save() { if (state === real) persist(); }
 
@@ -108,12 +114,10 @@
       throw new Error('환율 형식 오류');
     }
   }
-  async function fetchEOD(sym) {
-    const j = await getJSON(`https://api.twelvedata.com/eod?symbol=${sym}&apikey=${encodeURIComponent(real.apiKey)}`);
-    if (j.status === 'error' || j.code) throw new Error(j.message || 'API 오류');
-    const close = parseFloat(j.close);
-    if (!(close > 0)) throw new Error('가격 형식 오류');
-    return { price: close, date: String(j.datetime || '').slice(0, 10) };
+  // 장중이면 현재가, 장이 닫혀 있으면 마지막 종가
+  async function fetchQuote(sym) {
+    const j = await getJSON(`https://api.twelvedata.com/quote?symbol=${sym}&apikey=${encodeURIComponent(real.apiKey)}`);
+    return QN.parseQuote(j, Date.now());
   }
   async function refresh() {
     if (ui.busy) return;
@@ -124,7 +128,7 @@
       .catch((e) => errs.push('환율: ' + e.message)));
     if (real.apiKey) {
       for (const [k, sym] of [['T', 'TQQQ'], ['S', 'SGOV']]) {
-        jobs.push(fetchEOD(sym).then((r) => { state.px[k] = { v: r.price, date: r.date, src: 'auto', ts: Date.now() }; })
+        jobs.push(fetchQuote(sym).then((r) => { state.px[k] = { v: r.price, date: r.date, src: 'auto', ts: Date.now(), live: r.open, at: r.at, pc: r.prevClose, pcDate: r.prevDate }; })
           .catch((e) => errs.push(`${sym}: ${e.message}`)));
       }
     } else {
@@ -152,20 +156,32 @@
   const sameOrder = (a, b) => a.side === b.side && a.sym === b.sym && a.qty === b.qty && Math.abs(a.limit - b.limit) < 0.005;
   const isPinned = (o) => state.pending.some((p) => sameOrder(p, o));
 
+  // 걸어둔 주문은 "가장 최근에 끝난 종가"로 판정한다. 장중 현재가로는 판정하지 않는다
   function judge(p) {
     const T = state.px.T;
-    const changed = (T.date && T.date !== p.refAsof) || (!T.date && T.v !== p.refPrice);
-    if (!changed || !(T.v > 0)) return null;
-    const fill = p.side === 'sell' ? T.v >= p.limit - 1e-9 : T.v <= p.limit + 1e-9;
-    return { close: T.v, fill };
+    if (!(T.v > 0)) return null;
+    if (!T.date) {
+      // 직접 입력한 값은 종가라고 보고 판정한다 (날짜를 몰라서 가격이 바뀌었는지만 본다)
+      if (T.v === p.refPrice) return null;
+      const fill = p.side === 'sell' ? T.v >= p.limit - 1e-9 : T.v <= p.limit + 1e-9;
+      return { close: T.v, fill, manual: true };
+    }
+    const c = T.live ? { date: T.pcDate, close: T.pc } : { date: T.date, close: T.v };
+    const j = QN.judgePending(p, c.date, c.close);
+    return j.judged ? { close: j.close, fill: j.fill, date: c.date } : null;
   }
   function pxLabel(p) {
     if (!p.v) return { t: '값을 입력해 주세요', stale: true };
     const age = Date.now() - p.ts;
     if (p.src === 'auto') {
+      if (p.live) {
+        const stale = age > LIVE_STALE_MS;
+        const hm = p.at ? ` 미국 ${QN.etParts(p.at).hm}` : '';
+        return { t: `현재가${hm}, 자동 ${ago(age)}` + (stale ? ' (새로고침 필요)' : ''), stale };
+      }
       const d = daysOld(p.date);
       const stale = age > STALE_MS || (d != null && d > 4);
-      return { t: `${p.date} 기준, 자동 ${ago(age)}` + (stale ? ' (새로고침 필요)' : ''), stale };
+      return { t: `${p.date} 종가, 자동 ${ago(age)}` + (stale ? ' (새로고침 필요)' : ''), stale };
     }
     const stale = !p.ts || age > STALE_MS;
     return { t: p.ts ? `직접 입력, ${ago(age)}` + (stale ? ' (오늘 가격이 맞나요?)' : '') : '직접 입력', stale };
@@ -188,7 +204,7 @@
   function basisRow() {
     const T = state.px.T, S = state.px.S;
     const stale = [T, S].some((p) => p.v > 0 && pxLabel(p).stale);
-    const basis = T.date ? `${T.date} 종가 기준` : '직접 입력한 가격 기준';
+    const basis = T.live ? `현재가 기준${T.at ? ` (미국 ${QN.etParts(T.at).hm})` : ''}` : T.date ? `${T.date} 종가 기준` : '직접 입력한 가격 기준';
     return `<div class="row" style="margin-bottom:14px"><span class="small ${stale ? '' : 'muted'}" style="${stale ? 'color:var(--warn);font-weight:600' : ''}">${basis}${stale ? ', 갱신 필요' : ''}</span>
       <button class="btn small" data-act="refresh" ${ui.busy ? 'disabled' : ''}>${ui.busy ? '불러오는 중' : '시세 불러오기'}</button></div>
       ${ui.msg ? `<div class="small muted" style="white-space:pre-line;margin:-6px 0 12px">${esc(ui.msg)}</div>` : ''}`;
@@ -199,7 +215,7 @@
     if (!(m.H > 0)) {
       return `<section class="card empty"><div class="big">🧭</div>
         <p><b>아직 보유 수량이 없어요</b></p>
-        <p class="muted small">아래에 추가 투입금을 넣으면 TQQQ와 SGOV를 얼마씩 사야 하는지 계산해 드려요.<br>이미 보유 중이라면 <button class="link" data-tab-go="hold">보유 탭</button>에서 수량을 입력해 주세요.</p></section>`;
+        <p class="muted small"><button class="link" data-tab-go="hold">보유 탭</button>에 추가 투입금(원)을 넣으면 TQQQ와 SGOV를 얼마씩 사야 하는지 계산해 드려요.<br>이미 보유 중이라면 같은 탭에서 수량을 입력해 주세요.</p></section>`;
     }
     const w = m.w, { lo, hi, t } = plan0;
     const rmin = Math.max(0, (lo - 0.08) * 100), rmax = Math.min(100, (hi + 0.08) * 100);
@@ -231,7 +247,7 @@
     const out = [];
     const T = state.px.T, S = state.px.S, F = state.px.F;
     const any = [['TQQQ', T], ['SGOV', S], ['환율', F]].filter(([, p]) => p.v > 0 && pxLabel(p).stale).map(([n]) => n);
-    if (any.length) out.push(`<div class="note warn small">${any.join(', ')} 값이 오래됐을 수 있어요. 주문 수량과 지정가는 <b>직전 종가</b> 기준이라, 오늘 종가로 갱신한 뒤 확인하세요.</div>`);
+    if (any.length) out.push(`<div class="note warn small">${any.join(', ')} 값이 오래됐을 수 있어요. 주문 수량과 지정가는 <b>입력된 가격</b> 기준이라, 시세를 새로 불러온 뒤 확인하세요.</div>`);
     if (state.depKRW > 0 && !(F.v > 0)) out.push('<div class="note bad small">추가 투입금을 달러로 바꾸려면 환율이 필요해요.</div>');
     return out.join('');
   }
@@ -241,8 +257,8 @@
     const items = state.pending.map((p, i) => {
       const j = E.ready ? judge(p) : null;
       const jt = j
-        ? `종가 ${usd(j.close)} 기준으로 <b>${j.fill ? '체결 조건을 충족' : '체결 조건에 못 미침'}</b>해요 (${j.fill ? '체결됐을 가능성이 높아요' : '미체결로 보여요'}). 증권사 체결 내역으로 꼭 확인하세요.`
-        : '새 종가를 반영하면 체결 여부를 예상해 드려요.';
+        ? `${j.manual ? '입력한 가격이 주문한 날의 종가라면, ' : `${j.date.slice(5)} 종가 `}${usd(j.close)} 기준으로 <b>${j.fill ? '체결 조건을 충족' : '체결 조건에 못 미침'}</b>해요 (${j.fill ? '체결됐을 가능성이 높아요' : '미체결로 보여요'}). 증권사 체결 내역으로 꼭 확인하세요.`
+        : '주문한 장이 끝난 뒤 시세를 불러오면 체결 여부를 예상해 드려요.';
       return `<div class="order ${p.side}">
         <div class="order-h"><span class="side">${p.side === 'buy' ? '매수' : '매도'}</span><b>${esc(p.sym)}</b><span class="qty">${p.qty}주</span>${p.tag ? `<span class="tag">${esc(p.tag)}</span>` : ''}</div>
         <div class="limit">LOC 지정가 ${usd(p.limit)}</div>
@@ -262,7 +278,7 @@
     if (dep.qS > 0) lines.push(`<div class="row"><span>SGOV 매수</span><b>${dep.qS}주</b></div><div class="small muted">약 ${usd(dep.qS * st.pS)}</div>`);
     const none = !lines.length;
     return `<section class="card"><h2>투입금 배치</h2>
-      <p class="small muted" style="margin:0 0 10px">${krw(state.depKRW)}을 환율 ${st.fx.toLocaleString('ko-KR')}원으로 환전하면 약 ${usd(dep.depUSD)}예요.</p>
+      <p class="small muted" style="margin:0 0 10px">${krw(state.depKRW)}을 환율 ${st.fx.toLocaleString('ko-KR')}원으로 환전하면 약 ${usd(dep.depUSD)}예요. <button class="link" data-tab-go="hold">금액 고치기</button></p>
       ${none ? '<div class="note info small">1주를 살 만큼의 금액이 아니에요. 예수금으로 두었다가 다음에 함께 배치하세요.</div>' : `<div class="stack">${lines.join('')}</div>
       <div class="totals"><span>남는 현금 <b>${usd(dep.cashAfter)}</b></span><span>비중 <b>${pct1(E.m.w)}</b>에서 <b>${pct1(dep.wAfter)}</b></span></div>`}
       <div class="btns" style="margin-top:12px"><button class="btn primary grow" data-act="${none ? 'dep-only' : 'apply-dep'}">${none ? '예수금 입금만 반영' : '매수 체결 반영'}</button></div>
@@ -359,7 +375,7 @@
     const E = engine();
     if (!E.ready) {
       return `<section class="card empty"><div class="big">🧭</div><p><b>시세를 입력하면 시작해요</b></p>
-        <p class="muted small">아래 칸에 TQQQ와 SGOV의 직전 종가, 환율을 입력하거나 불러오기 버튼을 눌러 주세요.<br>보유 수량은 <button class="link" data-tab-go="hold">보유 탭</button>에서 입력해요.</p>
+        <p class="muted small">아래 칸에 TQQQ와 SGOV의 현재가(장이 닫혀 있으면 종가), 환율을 입력하거나 불러오기 버튼을 눌러 주세요.<br>보유 수량은 <button class="link" data-tab-go="hold">보유 탭</button>에서 입력해요.</p>
         <div class="btns" style="justify-content:center;margin-top:8px"><button class="btn small" data-act="refresh" ${ui.busy ? 'disabled' : ''}>${ui.busy ? '불러오는 중' : '시세 불러오기'}</button></div>
         ${ui.msg ? `<div class="small muted" style="white-space:pre-line;margin-top:8px">${esc(ui.msg)}</div>` : ''}</section>`;
     }
@@ -383,14 +399,22 @@
       el.textContent = l.t; el.classList.toggle('stale', l.stale);
     }
     const dh = $('#dep-hint');
-    if (dh) dh.textContent = state.depKRW > 0 && state.px.F.v > 0 ? `약 ${usd(state.depKRW / state.px.F.v)}` : '';
+    if (dh) {
+      const fx = state.px.F.v;
+      dh.textContent = !(state.depKRW > 0) ? ''
+        : fx > 0 ? `약 ${usd(state.depKRW / fx)} (환율 ${fx.toLocaleString('ko-KR')}원 기준)`
+        : '오늘 탭에 환율이 있어야 달러로 계산해요';
+    }
   }
   function renderToday() {
     const px = state.px;
     const banner = (!isStandalone() && isIOS() && !real.hideInstall)
       ? `<div class="note info small" style="margin-bottom:12px">홈 화면에 추가하면 앱처럼 열려요. Safari 아래쪽 공유 버튼을 누르고 <b>홈 화면에 추가</b>를 고르세요.
          <div class="btns" style="margin-top:8px"><button class="btn small" data-act="hide-install">알겠어요</button></div></div>` : '';
-    $('#app').innerHTML = `${banner}
+    const notifHint = (!syncOn() && !real.hideNotifHint)
+      ? `<div class="note info small" style="margin-bottom:12px">🔔 앱을 못 열 때도 비율이 깨지면 폰으로 알림을 받을 수 있어요. <button class="link" data-tab-go="set">설정</button>에서 켜 보세요.
+         <div class="btns" style="margin-top:8px"><button class="btn small" data-act="hide-notif">나중에</button></div></div>` : '';
+    $('#app').innerHTML = `${banner}${notifHint}
       <div id="res-a"></div>
       <section class="card">
         <h2>시세 직접 입력</h2>
@@ -399,12 +423,9 @@
           <label class="field"><span>SGOV ($)</span><input class="in" id="in-S" inputmode="decimal" autocomplete="off" value="${px.S.v || ''}"><i class="src" id="src-S"></i></label>
           <label class="field"><span>환율 (원)</span><input class="in" id="in-F" inputmode="decimal" autocomplete="off" value="${px.F.v || ''}"><i class="src" id="src-F"></i></label>
         </div>
-        <p class="small muted" style="margin:10px 0 0">증권사 앱의 직전 종가를 그대로 넣어도 돼요.</p>
+        <p class="small muted" style="margin:10px 0 0">증권사 앱의 현재가를 그대로 넣어도 돼요. 장중에는 현재가, 장이 닫혀 있으면 종가가 들어와요.</p>
       </section>
-      <section class="card">
-        <label class="field"><span>추가 투입금 (원), 없으면 비워 두세요</span><input class="in" id="in-dep" inputmode="numeric" autocomplete="off" value="${state.depKRW || ''}"></label>
-        <div class="small muted" id="dep-hint" style="margin-top:4px"></div>
-      </section>
+      ${state.depKRW > 0 ? '' : '<p class="small muted" style="margin:0 4px 14px">추가로 넣을 돈이 있으면 <button class="link" data-tab-go="hold">보유 탭</button>에 적어 주세요.</p>'}
       <div id="res-b"></div>`;
     paintSrc(); renderResults();
   }
@@ -426,10 +447,12 @@
           <label class="field"><span>TQQQ 보유 수량 (주)</span><input class="in" data-hold="B" inputmode="decimal" value="${h.B}"></label>
           <label class="field"><span>SGOV 보유 수량 (주)</span><input class="in" data-hold="C" inputmode="decimal" value="${h.C}"></label>
           <label class="field"><span>예수금 ($)</span><input class="in" data-hold="D" inputmode="decimal" value="${h.D}"></label>
+          <label class="field" style="padding-top:12px;border-top:1px solid var(--line)"><span>이번에 추가로 넣을 돈 (원)</span><input class="in" id="in-dep" inputmode="numeric" autocomplete="off" placeholder="없으면 비워 두세요" value="${state.depKRW || ''}"><i class="src" id="dep-hint"></i></label>
         </div>
-        <p class="small muted" style="margin-bottom:0">체결 반영 버튼을 쓰면 자동으로 바뀌어요. 증권사 앱과 수량이 다를 때만 여기서 직접 맞추세요. 고친 내용은 기록에 남아요.</p>
+        <p class="small muted" style="margin-bottom:0">위 세 칸은 지금 가진 수량이에요. 체결 반영 버튼을 쓰면 자동으로 바뀌고, 증권사 앱과 다를 때만 직접 맞추세요(고친 내용은 기록에 남아요).<br>맨 아래 칸은 원화로 새로 입금할 금액이에요. 증권사가 미국 주식을 살 때 알아서 환전해 주는 경우를 가정해, 오늘 탭에서 TQQQ와 SGOV를 몇 주씩 살지 계산해 드려요. 매수를 반영하면 이 칸은 자동으로 비워져요.</p>
       </section>
       <section class="card"><h2>평가</h2>${sum}</section>`;
+    paintSrc();
   }
 
   /* ───────────── 화면: 기록 ───────────── */
@@ -469,6 +492,7 @@
     const s = state.settings;
     const f = (id, label, val, step, hint) => `<label class="field"><span>${label}</span><input class="in" data-set="${id}" inputmode="decimal" value="${val}"><i class="src">${hint || ''}</i></label>`;
     $('#app').innerHTML = `
+      ${notifCardHTML()}
       <section class="card"><h2>전략</h2>
         <div class="grid2">
           ${f('target', 'TQQQ 목표 비중 (%)', s.target, 1, '나머지는 SGOV와 예수금')}
@@ -490,6 +514,7 @@
           <p style="margin:0">밴드를 넘은 날은 <b>주문 1개</b>로 한 번에 목표 비중으로 되돌려요. 수량은 지금 가격에서 목표 비중이 되는 주수예요.</p>
           <p style="margin:0"><b>지정가</b>는 종가가 많이 움직여 체결돼도 비중이 목표에서 미리 걸기 구간(기본 ±3%p) 넘게 벗어나지 않도록 잡아요. 그 선을 벗어나는 날은 체결되지 않고 다음 날 다시 계산해요.</p>
           <p style="margin:0">밴드에 가까워졌을 때(53%, 47%부터) 미리 거는 주문은 밴드 경계 가격에서 목표 비중이 되는 수량이에요.</p>
+          <p style="margin:0">시세 불러오기와 밤 11시 30분 알림은 장이 열려 있으면 <b>현재가</b>, 닫혀 있으면 마지막 종가로 계산해요. 걸어둔 LOC 주문이 체결됐는지 판단할 때만 항상 <b>종가</b>를 써요.</p>
           <p style="margin:0">투입금은 매수만으로 배치해요. 이미 목표를 넘은 쪽은 사지 않고, 현금 한도를 넘겨 사라는 안내는 하지 않아요.</p>
           <p style="margin:0" class="muted">참고용 계산 도구예요. 실제 주문 전에 증권사 화면의 수량과 가격을 꼭 확인하세요.</p>
         </div></details></section>
@@ -497,6 +522,7 @@
         <p class="small muted" style="margin-top:0">${isStandalone() ? '홈 화면 앱으로 실행 중이에요.' : 'iPhone은 Safari에서 공유 버튼을 누르고 홈 화면에 추가를 고르면 앱처럼 쓸 수 있어요.'}</p>
         <div class="btns"><button class="btn danger" data-act="reset">모든 데이터 지우기</button></div>
       </section>`;
+    if (syncOn()) { paintNotif(); if (!inTest()) loadStatus(); }
   }
 
   /* ───────────── 체결 반영 시트 ───────────── */
@@ -567,7 +593,7 @@
     state.history.shift(); save(); toast('되돌렸어요'); render();
   }
   function exportBackup() {
-    const { apiKey, ...rest } = state;
+    const { apiKey, sync, hideNotifHint, ...rest } = state;
     copyText(JSON.stringify(rest));
   }
   function restoreBackup() {
@@ -577,7 +603,7 @@
     try { obj = JSON.parse(txt); } catch (e) { return toast('백업 형식이 올바르지 않아요'); }
     if (!obj || typeof obj !== 'object' || !obj.hold || !Number.isFinite(Number(obj.hold.B))) return toast('백업 형식이 올바르지 않아요');
     if (!window.confirm('현재 데이터를 백업 내용으로 바꿀까요?')) return;
-    real = merge(defaults(), { ...obj, apiKey: real.apiKey });
+    real = merge(defaults(), { ...obj, apiKey: real.apiKey, sync: real.sync, hideNotifHint: real.hideNotifHint });
     state = real; persist(); toast('복원했어요'); render();
   }
   function paintBadge() {
@@ -621,13 +647,34 @@
     const el = ev.target.closest('[data-act]'); if (!el) return;
     const act = el.dataset.act, i = Number(el.dataset.i);
     const E = ['pin', 'copy', 'apply-dep', 'apply-fund', 'apply-idle', 'dep-only', 'fill'].includes(act) ? engine() : null;
-    if (inTest() && ['export', 'restore', 'reset'].includes(act)) {
+    if (inTest() && ['export', 'restore', 'reset', 'conn-save', 'conn-clear', 'notif-test', 'notif-check'].includes(act)) {
       return toast('모의거래 모드에서는 쓸 수 없어요. 먼저 모의거래를 꺼 주세요');
     }
     switch (act) {
       case 'mode-toggle': if (inTest()) exitTest(); else enterTest(); break;
       case 'refresh': refresh(); break;
       case 'hide-install': real.hideInstall = true; persist(); render(); break;
+      case 'hide-notif': real.hideNotifHint = true; persist(); render(); break;
+      case 'conn-save': connect(el); break;
+      case 'conn-clear':
+        if (window.confirm('이 앱과 알림 서버의 연결을 끊을까요?\n서버에 남은 값과 서버의 자동 점검은 그대로예요. 알림을 완전히 끄려면 Cloudflare에서 크론 트리거를 지워야 해요.')) {
+          real.sync = { url: '', token: '', lastOk: 0, lastErr: '' }; syncSt.sent = ''; ui.status = null; persist(); toast('연결을 끊었어요'); render();
+        }
+        break;
+      case 'notif-test': runBtn(el, '보내는 중…', async () => {
+        try { await callServer('/test', 'POST', '{}'); toast('테스트 알림을 보냈어요. 폰에 알림이 왔는지 확인해 주세요'); }
+        catch (e) { toast('테스트 알림 실패: ' + e.message); }
+      }); break;
+      case 'notif-check': runBtn(el, '점검 중…', async () => {
+        try {
+          const ok = await doSync(true);
+          if (!ok) throw new Error('보유 수량을 서버에 올리지 못했어요 (' + (real.sync.lastErr || '네트워크') + ')');
+          const j = await callServer('/check', 'POST', '{}', 30000);
+          const r = j.result || {};
+          toast(r.sendError ? '점검은 했지만 알림 전송에 실패했어요: ' + r.sendError : r.sent ? '점검 결과를 알림으로 보냈어요' : (r.note || '점검했어요'));
+        } catch (e) { toast('점검 실패: ' + e.message); }
+        loadStatus(true);
+      }); break;
       case 'copy': { const o = E.plan && E.plan.orders[i]; if (o) copyText(`${o.sym} ${o.side === 'buy' ? '매수' : '매도'} LOC ${o.qty}주 지정가 $${o.limit.toFixed(2)}`); break; }
       case 'pin': {
         const o = E.plan && E.plan.orders[i]; if (!o || isPinned(o)) break;
@@ -678,7 +725,7 @@
       case 'export': exportBackup(); break;
       case 'restore': restoreBackup(); break;
       case 'reset':
-        if (window.confirm('보유, 기록, 설정을 모두 지울까요? 되돌릴 수 없어요.')) { real = defaults(); state = real; persist(); toast('초기화했어요'); render(); }
+        if (window.confirm('보유, 기록, 설정을 모두 지울까요? 되돌릴 수 없어요.' + (syncOn() ? '\n(알림 서버 연결은 유지되고, 서버에도 비워진 값이 올라가요)' : ''))) { const keep = real.sync; real = defaults(); real.sync = keep; state = real; persist(); toast('초기화했어요'); render(); }
         break;
     }
   });
@@ -723,8 +770,163 @@
     }
   });
 
+
+  /* ───────────── 알림 서버 (Cloudflare Worker) ───────────── */
+  const syncOn = () => !!(real.sync && real.sync.url && real.sync.token);
+
+  /** "https://이름.workers.dev#비밀번호" 형태의 연결 코드를 나눈다 */
+  function parseConn(txt) {
+    const t = String(txt || '').trim();
+    const i = t.indexOf('#');
+    if (i < 0) return { err: '주소와 비밀번호 사이에 #이 있어야 해요' };
+    let u;
+    try { u = new URL(t.slice(0, i).trim()); } catch (e) { return { err: '서버 주소 형식이 올바르지 않아요' }; }
+    const token = t.slice(i + 1).trim();
+    if (u.protocol !== 'https:') return { err: '주소는 https로 시작해야 해요' };
+    if (token.length < 8 || /\s/.test(token)) return { err: '비밀번호는 공백 없이 8자 이상이어야 해요' };
+    return { url: u.origin, token };
+  }
+
+  async function callServer(path, method, body, ms = 15000) {
+    const ctl = new AbortController();
+    const id = setTimeout(() => ctl.abort(), ms);
+    try {
+      const headers = { authorization: 'Bearer ' + real.sync.token };
+      if (body) headers['content-type'] = 'application/json';
+      const r = await fetch(real.sync.url + path, { method, headers, body, signal: ctl.signal, cache: 'no-store' });
+      let j = null;
+      try { j = await r.json(); } catch (e) { /* 본문 없음 */ }
+      if (!r.ok || !j || j.ok === false) throw new Error((j && j.error) || ('HTTP ' + r.status));
+      return j;
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('응답 시간 초과');
+      if (e instanceof TypeError) throw new Error('서버에 연결할 수 없어요 (주소나 인터넷을 확인해 주세요)');
+      throw e;
+    } finally { clearTimeout(id); }
+  }
+
+  function syncBody() {
+    return JSON.stringify({
+      settings: real.settings, hold: real.hold, depKRW: real.depKRW,
+      pending: real.pending.map((p) => ({ sym: p.sym, side: p.side, qty: p.qty, limit: p.limit, placedAt: p.placedAt }))
+    });
+  }
+  function scheduleSync() {
+    if (!syncOn()) return;
+    clearTimeout(syncSt.timer);
+    syncSt.timer = setTimeout(() => { doSync(false); }, 2000);
+  }
+  /** 보유 수량과 설정을 서버로 올린다. 같은 내용이면 보내지 않는다. 성공 여부를 돌려준다 */
+  function doSync(force) {
+    clearTimeout(syncSt.timer);
+    const run = syncSt.chain.then(async () => {
+      if (!syncOn()) return false;
+      const body = syncBody();
+      if (!force && body === syncSt.sent) return true;
+      try {
+        await callServer('/sync', 'POST', body);
+        syncSt.sent = body; real.sync.lastOk = Date.now(); real.sync.lastErr = '';
+        return true;
+      } catch (e) {
+        real.sync.lastErr = e.message || String(e);
+        return false;
+      } finally {
+        writeReal(true);
+        if (tab === 'set') paintNotif();
+      }
+    });
+    syncSt.chain = run.catch(() => {});
+    return run;
+  }
+  async function loadStatus(force) {
+    if (!syncOn() || inTest()) return;
+    if (!force && ui.status && !ui.status.err && Date.now() - ui.status.at < 20000) return;
+    try { ui.status = { at: Date.now(), data: await callServer('/status', 'GET') }; }
+    catch (e) { ui.status = { at: Date.now(), err: e.message }; }
+    paintNotif();
+  }
+  async function connect(btn) {
+    const box = $('#conn-code');
+    const r = parseConn(box && box.value);
+    if (r.err) return toast(r.err);
+    const prev = real.sync;
+    if (btn) { btn.disabled = true; btn.textContent = '확인 중…'; }
+    real.sync = { ...prev, url: r.url, token: r.token, lastOk: 0, lastErr: '' };
+    try {
+      const st = await callServer('/status', 'GET');
+      const empty = !(real.hold.B > 0 || real.hold.C > 0 || real.hold.D > 0) && !real.history.length;
+      if (st.hasState && empty && !window.confirm('서버에 이미 저장된 보유 수량이 있어요.\n이 기기는 비어 있어서, 연결하면 서버의 값이 0으로 덮어써져요.\n다른 곳에 쓰던 데이터가 있다면 먼저 백업을 복원하세요. 그래도 연결할까요?')) {
+        real.sync = prev; return renderSet();
+      }
+    } catch (e) {
+      real.sync = prev; toast('연결하지 못했어요: ' + e.message);
+      if (btn) { btn.disabled = false; btn.textContent = '연결하기'; }
+      return;
+    }
+    syncSt.sent = ''; ui.status = null; writeReal(true);
+    const ok = await doSync(true);
+    toast(ok ? '연결했어요. 테스트 알림으로 폰을 확인해 보세요' : '연결은 했지만 값을 올리지 못했어요: ' + real.sync.lastErr);
+    renderSet();
+  }
+  async function runBtn(btn, busyText, fn) {
+    if (btn.disabled) return;
+    const old = btn.textContent; btn.disabled = true; btn.textContent = busyText;
+    try { await fn(); } finally { if (btn.isConnected) { btn.disabled = false; btn.textContent = old; } }
+  }
+
+  const LEVEL = { none: '이상 없음', breach: '비중 이탈 알림', near: '밴드 접근 알림', pending: '주문 확인 알림', deposit: '투입금 알림', daily: '요약 알림', error: '시세 조회 실패', stale: '현재가 확인 못 함', skip: '건너뜀' };
+  function notifStatusHTML() {
+    if (!syncOn()) return '';
+    const sy = real.sync, rows = [];
+    rows.push(sy.lastErr
+      ? `<div class="note bad small">서버에 올리지 못했어요: ${esc(sy.lastErr)}</div>`
+      : `<div class="row small"><span class="muted">서버에 올린 시각</span><b>${sy.lastOk ? ago(Date.now() - sy.lastOk) : '아직 없음'}</b></div>`);
+    const st = ui.status;
+    if (!st) rows.push('<div class="small muted">서버 상태를 불러오는 중…</div>');
+    else if (st.err) rows.push(`<div class="note warn small">서버 상태를 못 불러왔어요: ${esc(st.err)}</div>`);
+    else {
+      const d = st.data, last = d.last;
+      if (!d.hasState) rows.push('<div class="note warn small">서버에 보유 수량이 아직 없어요. 잠시 뒤 다시 확인해 주세요.</div>');
+      if (!d.keySet) rows.push('<div class="note warn small">서버에 TWELVE_KEY가 없어요. 시세를 못 가져와요.</div>');
+      if (!d.topicSet) rows.push('<div class="note warn small">서버에 NTFY_TOPIC이 없어요. 알림을 못 보내요.</div>');
+      if (last) {
+        const w = typeof last.w === 'number' ? `, TQQQ 비중 ${pct1(last.w)}` : '';
+        rows.push(`<div class="row small"><span class="muted">마지막 점검 (${last.kind === 'manual' ? '수동' : '자동'})</span><b>${esc(last.stamp || '')}</b></div>
+          <div class="small muted">${esc(LEVEL[last.level] || last.level)}${esc(w)}${last.sent ? ', 알림 보냄' : ''}${last.asof ? `, 기준 ${esc(last.asof)}` : last.eodDate ? `, 기준 ${esc(last.eodDate)} 종가` : ''}${last.level === 'skip' || last.level === 'error' || last.level === 'stale' ? '<br>' + esc(last.note || '') : ''}</div>`);
+        if (last.sendError) rows.push(`<div class="note bad small">알림 전송 실패: ${esc(last.sendError)}</div>`);
+      } else rows.push('<div class="small muted">아직 자동 점검 기록이 없어요. 오늘 밤 11시 30분에 처음 점검해요.</div>');
+    }
+    return rows.join('');
+  }
+  function paintNotif() { const el = $('#notif-status'); if (el) el.innerHTML = notifStatusHTML(); }
+
+  function notifCardHTML() {
+    const s = state.settings, on = syncOn();
+    let host = '';
+    if (on) { try { host = new URL(real.sync.url).host; } catch (e) { host = real.sync.url; } }
+    const conn = on
+      ? `<div class="row" style="margin-bottom:10px"><span class="small"><b>연결됨</b> <span class="muted">${esc(host)}</span></span>
+          <button class="btn small" data-act="conn-clear">연결 끊기</button></div>
+        <div class="stack" id="notif-status"></div>`
+      : `<label class="field"><span>연결 코드</span><input class="in" id="conn-code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://이름.workers.dev#비밀번호"></label>
+        <div class="btns" style="margin-top:8px"><button class="btn primary grow" data-act="conn-save">연결하기</button></div>
+        <p class="small muted" style="margin-bottom:0">처음 한 번은 알림 서버를 만들어야 해요. 함께 드린 <b>알림설정.md</b>를 따라 하세요. 서버 주소와 비밀번호를 #으로 이어 붙인 연결 코드를 여기에 붙여 넣으세요.</p>`;
+    const sw = (key, title, desc, def) => `<label class="switch"><input type="checkbox" data-sw="${key}" ${(def ? s[key] !== false : !!s[key]) ? 'checked' : ''}><span><b>${title}</b><span class="small muted">${desc}</span></span></label>`;
+    return `<section class="card"><h2>🔔 자동 점검과 알림</h2>
+      <p class="small muted" style="margin-top:0">앱을 열지 않아도 <b>평일 밤 11시 30분</b>(한국 시간)에 서버가 개장 시점의 TQQQ와 SGOV 현재가로 비중을 계산해요. 밴드를 벗어났거나 걸어둔 주문을 확인할 때가 되면 폰으로 알려요. 미국 휴장일에는 쉬어요.</p>
+      ${conn}
+      ${sw('notifyNear', '밴드에 가까워지면 미리 알림', `${s.target - s.near}%, ${s.target + s.near}%에 닿으면 LOC를 미리 걸라고 알려요.`, true)}
+      ${sw('notifyDaily', '이상 없는 날도 요약 알림', '비중이 괜찮아도 매일 밤 한 줄로 알려요. 끄면 알릴 게 있을 때만 와요.', false)}
+      ${on ? `<div class="btns" style="margin-top:6px"><button class="btn grow" data-act="notif-test">테스트 알림</button><button class="btn grow" data-act="notif-check">지금 점검하기</button></div>
+      <p class="small muted" style="margin-bottom:0">지금 점검하기는 방금 시세(장이 닫혀 있으면 마지막 종가)로 바로 계산해서 결과를 알림으로 보내 줘요. 모의거래 모드에서는 쓸 수 없어요.</p>` : ''}
+    </section>`;
+  }
+
   /* ───────────── 시작 ───────────── */
   render();
+  scheduleSync();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSync(); });
+  window.addEventListener('online', scheduleSync);
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
   }

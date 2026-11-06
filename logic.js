@@ -15,7 +15,9 @@
     fee: 0.1,     // 매매 수수료 (%)
     buffer: 0,    // 투입금 배치 시 현금으로 남길 금액 (USD)
     split: false, // (고급) 밴드 이탈 상태에서 주문을 2개로 나누기. 기본은 1개
-    always: false // 항상 양방향 LOC 표시
+    always: false, // 항상 양방향 LOC 표시
+    notifyNear: true,   // 알림: 밴드 근접(미리 걸기 구간)도 알림
+    notifyDaily: false  // 알림: 관망인 날에도 매일 요약 알림
   };
 
   const EPS = 1e-9;
@@ -279,8 +281,221 @@
     return Math.floor((today - d.getTime()) / 86400000);
   }
 
+
+  /* ───────────── 분석 묶음 (앱과 알림 서버가 같이 쓴다) ───────────── */
+
+  /** 보유/시세/투입금/설정으로 오늘의 계획을 한 번에 계산 */
+  function analyze(inp) {
+    const h = inp.hold, px = inp.px, cfg = Object.assign({}, DEFAULT_SETTINGS, inp.settings || {});
+    const st = { B: h.B, C: h.C, D: h.D, pT: px.pT, pS: px.pS, fx: px.fx || 0, depKRW: inp.depKRW || 0 };
+    if (!(st.pT > 0 && st.pS > 0)) return { ready: false, st, cfg };
+    const plan0 = planLOC(st, cfg);
+    const dep = st.depKRW > 0 && st.fx > 0 ? planDeposit(st, cfg) : null;
+    const st2 = dep ? afterDeposit(st, dep) : st;
+    const plan = dep ? planLOC(st2, cfg) : plan0;
+    return { ready: true, st, st2, cfg, plan0, dep, plan, m: metrics(st) };
+  }
+
+  /* ───────────── 미국 주식시장 달력 ───────────── */
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const ymd = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
+  /** m월의 n번째 wd요일 날짜(일). wd: 0=일 ... 6=토 */
+  function nthWeekday(y, m, wd, n) {
+    const first = new Date(Date.UTC(y, m - 1, 1)).getUTCDay();
+    return 1 + ((wd - first + 7) % 7) + (n - 1) * 7;
+  }
+  function lastWeekday(y, m, wd) {
+    const last = new Date(Date.UTC(y, m, 0));
+    return last.getUTCDate() - ((last.getUTCDay() - wd + 7) % 7);
+  }
+  function easterSunday(y) {
+    const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+    const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+    const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+    return { month: Math.floor((h + l - 7 * m + 114) / 31), day: ((h + l - 7 * m + 114) % 31) + 1 };
+  }
+  /** 토요일이면 금요일, 일요일이면 월요일에 쉰다 */
+  function observed(y, m, d) {
+    const wd = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    const t = new Date(Date.UTC(y, m - 1, d + (wd === 6 ? -1 : wd === 0 ? 1 : 0)));
+    return ymd(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+  }
+  /** 해당 연도의 NYSE 정규 휴장일 (YYYY-MM-DD 목록). 임시 휴장(국가 추모일 등)은 포함하지 않는다 */
+  function usMarketHolidays(y) {
+    const out = [];
+    const jan1 = new Date(Date.UTC(y, 0, 1)).getUTCDay();
+    if (jan1 === 0) out.push(ymd(y, 1, 2)); else if (jan1 !== 6) out.push(ymd(y, 1, 1)); // 토요일 신정은 쉬지 않음
+    out.push(ymd(y, 1, nthWeekday(y, 1, 1, 3)));            // 마틴 루터 킹 데이
+    out.push(ymd(y, 2, nthWeekday(y, 2, 1, 3)));            // 대통령의 날
+    const e = easterSunday(y);
+    const gf = new Date(Date.UTC(y, e.month - 1, e.day - 2));
+    out.push(ymd(y, gf.getUTCMonth() + 1, gf.getUTCDate())); // 성금요일
+    out.push(ymd(y, 5, lastWeekday(y, 5, 1)));              // 메모리얼 데이
+    out.push(observed(y, 6, 19));                            // 준틴스
+    out.push(observed(y, 7, 4));                             // 독립기념일
+    out.push(ymd(y, 9, nthWeekday(y, 9, 1, 1)));            // 노동절
+    out.push(ymd(y, 11, nthWeekday(y, 11, 4, 4)));          // 추수감사절
+    out.push(observed(y, 12, 25));                           // 크리스마스
+    return out;
+  }
+  function isUsMarketHoliday(dateStr) {
+    const y = Number(String(dateStr).slice(0, 4));
+    return usMarketHolidays(y).indexOf(dateStr) >= 0;
+  }
+  /** 해당 날짜의 뉴욕 시간대 UTC 오프셋(시간): 서머타임 -4, 아니면 -5 */
+  function usEtOffset(dateStr) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const t = Date.UTC(y, m - 1, d);
+    return t >= Date.UTC(y, 2, nthWeekday(y, 3, 0, 2)) && t < Date.UTC(y, 10, nthWeekday(y, 11, 0, 1)) ? -4 : -5;
+  }
+  /** 그날 정규장 마감(오후 4시, 뉴욕)의 UTC 시각(ms) */
+  function usCloseUtc(dateStr) { return Date.parse(dateStr + 'T16:00:00Z') - usEtOffset(dateStr) * 3600000; }
+  /** dateStr 하루 전부터 거슬러 올라가 가장 가까운 개장일 (주말, 휴장일 제외) */
+  function prevTradingDay(dateStr) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    let t = Date.UTC(y, m - 1, d);
+    for (let i = 0; i < 10; i++) {
+      t -= 86400000;
+      const dt = new Date(t), s = ymd(dt.getUTCFullYear(), dt.getUTCMonth() + 1, dt.getUTCDate()), wd = dt.getUTCDay();
+      if (wd !== 0 && wd !== 6 && !isUsMarketHoliday(s)) return s;
+    }
+    return null;
+  }
+
+  /** 시각(ms)의 뉴욕 현지 날짜와 시:분 */
+  function etParts(ms) {
+    let off = usEtOffset(new Date(ms).toISOString().slice(0, 10));
+    const etDate = new Date(ms + off * 3600000).toISOString().slice(0, 10);
+    off = usEtOffset(etDate);
+    const d = new Date(ms + off * 3600000);
+    return { date: d.toISOString().slice(0, 10), hm: d.toISOString().slice(11, 16) };
+  }
+
+  const LIVE_MAX_AGE_MS = 20 * 60000;
+
+  /**
+   * Twelve Data /quote 응답을 우리가 쓰는 값으로 바꾼다.
+   * price: 장중이면 현재가, 장이 닫혀 있으면 마지막 종가 / open: 지금 장이 열려 있는지
+   * date: 이 값이 속한 거래일 / prevClose, prevDate: 그 전 거래일 종가 / at: 마지막 시세 시각(ms)
+   */
+  function parseQuote(j, nowMs) {
+    if (!j || typeof j !== 'object' || j.status === 'error' || j.code) throw new Error((j && j.message) || 'API 오류');
+    const price = parseFloat(j.close);
+    if (!(price > 0)) throw new Error('가격 형식 오류');
+    const date = String(j.datetime || '').slice(0, 10);
+    const pc = parseFloat(j.previous_close);
+    const sec = Number(j.last_quote_at);
+    const at = sec > 0 ? sec * 1000 : 0;
+    return {
+      price, date,
+      open: j.is_market_open === true || j.is_market_open === 'true',
+      prevClose: pc > 0 ? pc : 0,
+      prevDate: /^\d{4}-\d{2}-\d{2}$/.test(date) ? prevTradingDay(date) : null,
+      at,
+      ageMs: at && nowMs ? Math.max(0, nowMs - at) : null
+    };
+  }
+
+  /** 가장 최근에 끝난 정규장 종가. 장중이면 전 거래일 종가, 장이 닫혀 있으면 지금 값이 곧 종가 */
+  function lastClose(q) {
+    return q.open ? { date: q.prevDate, close: q.prevClose } : { date: q.date, close: q.price };
+  }
+
+  /** 지금 값이 "오늘 열린 장의 최신 시세"인지. 아니면 이유를 돌려준다 */
+  function liveStatus(q, nowMs) {
+    if (!q.open) return { ok: false, why: '미국 증시가 아직 열리지 않았거나 쉬는 날이에요' };
+    const et = etParts(nowMs);
+    if (q.date !== et.date) return { ok: false, why: '시세가 아직 오늘 장 값이 아니에요 (시세 기준일 ' + (q.date || '없음') + ')' };
+    if (q.ageMs != null && q.ageMs > LIVE_MAX_AGE_MS) return { ok: false, why: '시세가 ' + Math.round(q.ageMs / 60000) + '분 전 값이에요' };
+    return { ok: true, why: '' };
+  }
+
+  /** 걸어둔 LOC 주문이 eodDate 종가로 결정됐는지, 체결 조건을 충족했는지 */
+  function judgePending(p, eodDate, close) {
+    if (!eodDate || !(close > 0) || !(p.placedAt > 0)) return { judged: false };
+    if (!(usCloseUtc(eodDate) > p.placedAt)) return { judged: false }; // 주문 걸기 전에 끝난 종가라 해당 없음
+    const fill = p.side === 'sell' ? close >= p.limit - EPS : close <= p.limit + EPS;
+    return { judged: true, fill, close };
+  }
+
+  /* ───────────── 알림 문구 ───────────── */
+  const fmtUsd = (x) => '$' + Number(x).toFixed(2);
+  const fmtPct = (x) => (x * 100).toFixed(1) + '%';
+  const fmtKrw = (x) => Math.round(x).toLocaleString('ko-KR') + '원';
+
+  /**
+   * 점검 결과 → 푸시 알림 내용.
+   * level: pending(걸어둔 주문 확인) / breach(밴드 이탈) / near(미리 걸기) / deposit(투입금) / daily(관망 요약) / none(보내지 않음)
+   * ctx = { res: analyze() 결과, eod: { T:{date,close}, S:{date,close} }, pending: [{ p, judged, fill }] }
+   */
+  function alertMessage(ctx) {
+    const { res, eod } = ctx;
+    const pending = ctx.pending || [];
+    const head = ctx.head || `기준 ${eod.T.date} 종가: TQQQ ${fmtUsd(eod.T.close)}, SGOV ${fmtUsd(eod.S.close)}`;
+
+    if (pending.length) {
+      if (!pending.some((x) => x.judged)) return { level: 'none', reason: '걸어둔 주문이 아직 마감 전이에요' };
+      const lines = pending.map((x) => {
+        const o = x.p;
+        const state = !x.judged ? '아직 마감 전' : x.fill ? '체결 조건 충족, 체결됐을 가능성이 높아요' : '체결 조건 미달, 미체결로 보여요';
+        const cl = x.judged && x.close > 0 ? `${x.date ? x.date.slice(5) + ' ' : ''}종가 ${fmtUsd(x.close)}, ` : '';
+        return `${o.sym} ${o.side === 'buy' ? '매수' : '매도'} ${o.qty}주(지정가 ${fmtUsd(o.limit)}): ${cl}${state}`;
+      });
+      return {
+        level: 'pending', priority: 4, tags: ['white_check_mark'], title: '✅ 걸어둔 주문을 확인해 주세요',
+        body: [head, ...lines, '증권사 체결 내역을 보고 츄테크 앱에서 "체결됐어요" 또는 "미체결, 삭제"를 눌러 주세요. 기록해야 다음 점검이 정확해져요.'].join('\n')
+      };
+    }
+    if (!res.ready) return { level: 'none', reason: '시세가 없어요' };
+
+    const { plan, dep, st2, cfg } = res;
+    const w = res.m.w;
+    const zone = plan.zone;
+    const lines = [head];
+    if (dep) {
+      const buys = [dep.qT > 0 ? `TQQQ ${dep.qT}주` : '', dep.qS > 0 ? `SGOV ${dep.qS}주` : ''].filter(Boolean).join(', ');
+      lines.push(`투입금 ${fmtKrw(res.st.depKRW)}(약 ${fmtUsd(dep.depUSD)}): ${buys ? buys + ' 매수' : '1주를 살 만큼이 아니라 예수금으로 보관'}`);
+    }
+    if (plan.fund && plan.fund.shortfall > 0) {
+      lines.push(plan.fund.enough
+        ? `먼저 데이장에 SGOV ${plan.fund.sgovSell}주를 팔아 달러를 확보하세요`
+        : 'SGOV를 모두 팔아도 매수 자금이 모자라요. 수량을 줄이거나 현금을 더 확보하세요');
+    }
+    plan.orders.forEach((o, i) => {
+      lines.push(`${plan.orders.length > 1 ? (i + 1) + ') ' : ''}TQQQ ${o.qty}주 LOC ${o.side === 'buy' ? '매수' : '매도'}, 지정가 ${fmtUsd(o.limit)}`);
+    });
+    const fin = plan.orders.length ? finishPlan(st2, plan, cfg) : [];
+    fin.forEach((f) => {
+      const c = f.comp;
+      const comp = `TQQQ ${fmtPct(c.t)}, SGOV ${fmtPct(c.s)}, 현금 ${fmtPct(c.c)}`;
+      if (f.side === 'sell' && f.sgov.act === 'buy') lines.push(`체결되면 SGOV ${f.sgov.qty}주를 매수하세요 (정리 후 ${comp})`);
+      else lines.push(`체결되면 비중 ${comp}`);
+    });
+
+    const act = plan.orders.length ? plan.orders[0].side : (zone.endsWith('up') ? 'sell' : 'buy');
+    const verb = act === 'sell' ? '매도' : '매수';
+    if (zone === 'breach-up' || zone === 'breach-dn') {
+      if (!plan.orders.length) lines.push('수량이 1주에 못 미쳐서 걸 주문이 없어요');
+      lines.push('LOC 주문은 미국 장 마감 전까지 걸면 돼요. 걸고 나면 앱에서 "주문 걸었어요"를 눌러 주세요.');
+      return { level: 'breach', priority: 4, tags: ['rotating_light'], title: `🚨 TQQQ ${fmtPct(w)}, ${verb} 리밸런싱 필요`, body: lines.join('\n') };
+    }
+    if ((zone === 'near-up' || zone === 'near-dn') && cfg.notifyNear !== false && plan.orders.length) {
+      lines.push('아직 밴드 안쪽이에요. 큰 변동에 대비해 미리 걸어 두는 주문이에요.');
+      return { level: 'near', priority: 3, tags: [zone === 'near-up' ? 'chart_with_upwards_trend' : 'chart_with_downwards_trend'], title: `${zone === 'near-up' ? '📈' : '📉'} TQQQ ${fmtPct(w)}, ${verb} LOC 미리 걸기`, body: lines.join('\n') };
+    }
+    if (dep) return { level: 'deposit', priority: 3, tags: ['moneybag'], title: '💰 투입금 배치 계획이 있어요', body: lines.join('\n') };
+    if (cfg.notifyDaily) {
+      const t = res.plan0.trig;
+      if (t) lines.push(`TQQQ가 ${(t.upPct * 100).toFixed(1)}% 오르거나 ${(Math.abs(t.dnPct) * 100).toFixed(1)}% 내리면 밴드에 닿아요`);
+      return { level: 'daily', priority: 2, tags: ['coffee'], title: `☕ TQQQ ${fmtPct(w)}, 오늘은 관망`, body: lines.join('\n') };
+    }
+    return { level: 'none', reason: '밴드 안쪽이라 알릴 게 없어요' };
+  }
+
   return {
     DEFAULT_SETTINGS, metrics, needSell, needBuy, planDeposit, afterDeposit,
-    planLOC, simulate, settle, finishPlan, scenarios, applyTrade, daysOld, r2
+    planLOC, simulate, settle, finishPlan, scenarios, applyTrade, daysOld, r2,
+    analyze, usMarketHolidays, isUsMarketHoliday, usEtOffset, usCloseUtc, prevTradingDay, judgePending, alertMessage,
+    etParts, parseQuote, lastClose, liveStatus, LIVE_MAX_AGE_MS
   };
 });

@@ -1,5 +1,5 @@
 /* 서비스 워커: 오프라인에서도 열리게 하고, 온라인이면 항상 최신 파일을 받아 온다. */
-const CACHE = 'qn-shell-v1';
+const CACHE = 'qn-shell-v2';
 const ASSETS = [
   './', './index.html', './style.css', './logic.js', './app.js', './manifest.webmanifest',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-512-maskable.png'
